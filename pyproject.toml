@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "airdrop-farmer"
+version = "0.2.0"
+description = "Config-driven automation orchestrator for legitimate airdrop task workflows"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+airdrop-farmer = "airdrop_farmer.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+addopts = "-q"
