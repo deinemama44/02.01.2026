@@ -1,0 +1,47 @@
+{
+  "dry_run": true,
+  "kill_switch": false,
+  "stop_on_first_task_failure": false,
+  "check_wallet_env_vars": false,
+  "state_file": ".airdrop_farmer_state.json",
+  "max_task_seconds": 30,
+  "cycle_interval_seconds": 60,
+  "wallets": [
+    {
+      "name": "wallet-main",
+      "address": "0xabc123...",
+      "private_key_env": "WALLET_MAIN_PK"
+    }
+  ],
+  "projects": [
+    {
+      "name": "ExampleDrop",
+      "enabled": true,
+      "cooldown_seconds": 5,
+      "tasks": [
+        {
+          "id": "check-in",
+          "provider": "mock",
+          "action": "daily_checkin",
+          "params": {
+            "points": 10
+          },
+          "retry": {
+            "attempts": 3,
+            "base_delay_seconds": 1
+          }
+        },
+        {
+          "id": "swap-task",
+          "provider": "mock",
+          "action": "small_swap",
+          "params": {
+            "from_token": "USDC",
+            "to_token": "ETH",
+            "amount": "5"
+          }
+        }
+      ]
+    }
+  ]
+}

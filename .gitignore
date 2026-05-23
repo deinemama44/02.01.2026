@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.venv/
+.airdrop_farmer_state.json
