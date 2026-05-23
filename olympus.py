@@ -171,6 +171,7 @@ active_trades: Dict[str, Dict] = {}
 grid_levels: Dict[str, List[Dict]] = {}
 shutdown_event = None
 last_health_ping = 0.0
+last_closed_at: Dict[str, float] = {}
 
 
 # ===========================================================================
@@ -722,7 +723,7 @@ def detect_rsi_divergence(closes, period=14) -> str:
 # ===========================================================================
 
 
-async def mtf_score(symbol: str) -> Tuple[int, str]:
+async def mtf_score(symbol: str) -> Tuple[float, str]:
     """Score signal confluence across timeframes."""
     bull, bear = 0.0, 0.0
     for tf in CFG["timeframes"]:
@@ -747,10 +748,10 @@ async def mtf_score(symbol: str) -> Tuple[int, str]:
         elif rsi > 65:
             bear += 0.5
     if bull >= CFG["mtf_min_score"] and bull > bear:
-        return int(bull), "long"
+        return bull, "long"
     if bear >= CFG["mtf_min_score"] and bear > bull:
-        return int(bear), "short"
-    return 0, "none"
+        return bear, "short"
+    return 0.0, "none"
 
 
 # ===========================================================================
@@ -872,7 +873,10 @@ async def train_ml():
             features = build_features(candles[:i])
             if not features or len(features) != 10:
                 continue
-            future_high = max(c[2] for c in candles[i:i + 10])
+            future_window = candles[i + 1:i + 11]
+            if not future_window:
+                continue
+            future_high = max(c[2] for c in future_window)
             current = candles[i][4]
             label = 1 if (future_high - current) / current > 0.003 else 0
             X_all.append(features)
@@ -1047,7 +1051,11 @@ async def kelly_size(confidence: float, equity: float) -> float:
         win_rate = 0.5
     avg_r = 1.5
     kelly = win_rate - (1 - win_rate) / avg_r
-    kelly = max(0.01, min(kelly, 0.25))
+    if kelly <= 0:
+        log.debug("kelly_size: negative edge (kelly=%.4f), using minimum size", kelly)
+        kelly = 0.01
+    else:
+        kelly = min(kelly, 0.25)
     size_pct = kelly * confidence * CFG["risk_per_trade"] / 0.02
     size_pct *= session_size_mult()
     if drawdown_recovery_remaining > 0:
@@ -1216,6 +1224,9 @@ async def manage_positions():
             close_side = "sell" if side == "buy" else "buy"
             await place_order(symbol, close_side, partial, params={"reduceOnly": True})
             trade["tp1_hit"] = True
+            trade["tp1_price"] = price
+            trade["tp1_filled_size"] = partial
+            trade["size"] -= partial  # Reduce size by partial amount
             trade["sl"] = entry  # Move to breakeven
             log.info("%s: TP1 hit, partial close, SL->BE", symbol)
             await tg_send(f"\u2705 {symbol} TP1 erreicht! SL auf Einstand")
@@ -1273,27 +1284,44 @@ async def close_position(symbol, trade, price, reason):
     sl_dist = trade["sl_dist_original"]
 
     close_side = "sell" if side == "buy" else "buy"
-    remaining = size * (1 - CFG["tp1_pct"]) if trade.get("tp1_hit") else size
-    if remaining > 0:
-        await place_order(symbol, close_side, remaining, params={"reduceOnly": True})
+    if size > 0:
+        await place_order(symbol, close_side, size, params={"reduceOnly": True})
 
+    # Calculate PnL including TP1 partial if it was hit
     if side == "buy":
-        pnl = (price - entry) * size
+        remaining_pnl = (price - entry) * size
+    else:
+        remaining_pnl = (entry - price) * size
+
+    tp1_pnl = 0.0
+    if trade.get("tp1_hit") and trade.get("tp1_price") and trade.get("tp1_filled_size"):
+        tp1_price = trade["tp1_price"]
+        tp1_size = trade["tp1_filled_size"]
+        if side == "buy":
+            tp1_pnl = (tp1_price - entry) * tp1_size
+        else:
+            tp1_pnl = (entry - tp1_price) * tp1_size
+
+    pnl = remaining_pnl + tp1_pnl
+    if side == "buy":
         r_mult = (price - entry) / sl_dist if sl_dist > 0 else 0
     else:
-        pnl = (entry - price) * size
         r_mult = (entry - price) / sl_dist if sl_dist > 0 else 0
 
     daily_pnl += pnl
     if pnl > 0:
         consec_wins += 1
         consec_losses = 0
-    else:
+    elif pnl < 0:
         consec_losses += 1
         consec_wins = 0
+    # pnl == 0 (break-even): don't touch streaks
 
-    if current_drawdown >= CFG["drawdown_recovery_threshold"]:
+    if current_drawdown >= CFG["drawdown_recovery_threshold"] and drawdown_recovery_remaining <= 0:
         drawdown_recovery_remaining = CFG["drawdown_recovery_trades"]
+
+    # Track last close time for cooldown
+    last_closed_at[symbol] = time.time()
 
     await db_close_trade(trade["id"], price, pnl, r_mult)
     await db_save_daily()
@@ -1413,7 +1441,7 @@ async def scan_signals():
 
         # Feature #1: MTF confluence
         mtf_sc, mtf_dir = await mtf_score(symbol)
-        if mtf_sc < CFG["mtf_min_score"]:
+        if mtf_sc < CFG["mtf_min_score"] or mtf_dir == "none":
             continue
 
         # Run strategies
@@ -1423,8 +1451,6 @@ async def scan_signals():
             try:
                 sig = await strat_fn(symbol, candles)
                 if sig and sig["confidence"] > best_conf:
-                    if mtf_dir == "none":
-                        continue
                     if ((mtf_dir == "long" and sig["side"] == "buy") or
                             (mtf_dir == "short" and sig["side"] == "sell")):
                         best_signal = sig
@@ -1456,10 +1482,7 @@ async def scan_signals():
             best_signal["confidence"] *= 1.1
 
         # Feature #13: cooldown
-        last_close = 0
-        for s in slippage_log:
-            if s.get("symbol") == symbol:
-                last_close = max(last_close, s.get("time", 0))
+        last_close = last_closed_at.get(symbol, 0)
         if time.time() - last_close < cooldown_seconds():
             continue
 
