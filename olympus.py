@@ -35,51 +35,52 @@ except ImportError:
 
 CFG = {
     "sprint_hours": 96,
-    "risk_per_trade": 0.03,
-    "max_risk_per_trade": 0.05,
-    "max_concurrent": 5,
-    "leverage_min": 15,
-    "leverage_max": 25,
-    "daily_loss_limit": 0.12,
-    "max_drawdown": 0.20,
-    "drawdown_recovery_threshold": 0.15,
-    "drawdown_recovery_size_mult": 0.5,
-    "drawdown_recovery_trades": 10,
-    "portfolio_heat_max": 0.25,
-    "tp1_r": 0.8,
-    "tp1_pct": 0.25,
-    "tp2_r": 2.5,
-    "trail_activate_r": 1.5,
-    "trail_atr_mult": 2.5,
-    "pyramid_r": 1.8,
-    "pyramid_size_pct": 0.40,
-    "max_trade_duration_hours": 4,
-    "max_trade_duration_min_r": 0.5,
-    "hard_timeout_hours": 6,
-    "cycle_sec": 8,
-    "cache_ttl": 30,
+    "risk_per_trade": 0.06,           # AGGRO: 6% pro Trade
+    "max_risk_per_trade": 0.12,       # AGGRO: bis 12%
+    "max_concurrent": 6,              # AGGRO: 6 gleichzeitig
+    "leverage_min": 18,               # AGGRO: min 18x
+    "leverage_max": 30,               # AGGRO: bis 30x
+    "daily_loss_limit": 0.20,         # AGGRO: 20% Tageslimit
+    "max_drawdown": 0.35,             # AGGRO: 35% DD erlaubt
+    "drawdown_recovery_threshold": 0.25,
+    "drawdown_recovery_size_mult": 0.7,
+    "drawdown_recovery_trades": 5,
+    "portfolio_heat_max": 0.40,       # AGGRO: 40% Heat
+    "tp1_r": 0.6,                     # Schnellerer erster TP
+    "tp1_pct": 0.20,                  # Weniger rausnehmen
+    "tp2_r": 2.0,                     # Schnellerer voller TP
+    "trail_activate_r": 1.0,          # Frueherer Trail
+    "trail_atr_mult": 2.0,            # Engerer Trail
+    "pyramid_r": 1.2,                 # Frueher pyramiden
+    "pyramid_size_pct": 0.50,         # Mehr dazu
+    "max_trade_duration_hours": 3,    # Kuerzer halten
+    "max_trade_duration_min_r": 0.3,
+    "hard_timeout_hours": 5,
+    "cycle_sec": 5,                   # AGGRO: schnellerer Scan
+    "cache_ttl": 15,                  # Frischere Daten
     "health_ping_sec": 30,
-    "cooldown_after_win": 10,
-    "cooldown_after_loss": 45,
-    "cooldown_base": 20,
-    "ml_retrain_hours": 6,
-    "ml_min_samples": 50,
-    "ml_confidence_threshold": 0.55,
+    "cooldown_after_win": 3,          # AGGRO: fast kein Cooldown
+    "cooldown_after_loss": 15,        # AGGRO: kurzer Cooldown
+    "cooldown_base": 5,               # AGGRO: minimal
+    "ml_retrain_hours": 3,            # Oefter trainieren
+    "ml_min_samples": 30,             # Weniger Samples noetig
+    "ml_confidence_threshold": 0.42,  # AGGRO: niedrigere Schwelle
     "timeframes": ["1m", "5m", "15m", "1h"],
-    "mtf_min_score": 2,
+    "mtf_min_score": 1.5,             # AGGRO: weniger Confluence noetig
     "sessions": {"asia": (0, 8), "london": (8, 14), "ny": (14, 21), "off": (21, 24)},
-    "session_vol_mult": {"asia": 0.8, "london": 1.0, "ny": 1.1, "off": 0.6},
-    "funding_threshold": 0.0005,
-    "margin_ratio_warn": 0.20,
-    "margin_reduce_pct": 0.50,
-    "correlation_threshold": 0.75,
-    "correlation_window": 50,
+    "session_vol_mult": {"asia": 0.9, "london": 1.0, "ny": 1.1, "off": 0.7},
+    "funding_threshold": 0.001,       # AGGRO: hoehere Funding toleriert
+    "margin_ratio_warn": 0.15,
+    "margin_reduce_pct": 0.30,
+    "correlation_threshold": 0.85,    # AGGRO: weniger Blocking
+    "correlation_window": 30,
     "symbols": [
         "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
         "XRP/USDT:USDT", "DOGE/USDT:USDT", "ARB/USDT:USDT",
         "AVAX/USDT:USDT", "LINK/USDT:USDT", "OP/USDT:USDT",
         "MATIC/USDT:USDT", "ADA/USDT:USDT", "DOT/USDT:USDT",
         "NEAR/USDT:USDT", "APT/USDT:USDT", "SUI/USDT:USDT",
+        "WIF/USDT:USDT", "PEPE/USDT:USDT", "FET/USDT:USDT",
     ],
     "dash_port": 8080,
     "dash_host": "0.0.0.0",
