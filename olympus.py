@@ -35,54 +35,54 @@ except ImportError:
 
 CFG = {
     "sprint_hours": 96,
-    "risk_per_trade": 0.06,           # AGGRO: 6% pro Trade
-    "max_risk_per_trade": 0.12,       # AGGRO: bis 12%
-    "max_concurrent": 6,              # AGGRO: 6 gleichzeitig
-    "leverage_min": 18,               # AGGRO: min 18x
-    "leverage_max": 30,               # AGGRO: bis 30x
-    "daily_loss_limit": 0.20,         # AGGRO: 20% Tageslimit
-    "max_drawdown": 0.35,             # AGGRO: 35% DD erlaubt
-    "drawdown_recovery_threshold": 0.25,
+    "risk_per_trade": 0.10,
+    "max_risk_per_trade": 0.18,
+    "max_concurrent": 8,
+    "leverage_min": 22,
+    "leverage_max": 35,
+    "daily_loss_limit": 0.30,
+    "max_drawdown": 0.45,
+    "drawdown_recovery_threshold": 0.30,
     "drawdown_recovery_size_mult": 0.7,
-    "drawdown_recovery_trades": 5,
-    "portfolio_heat_max": 0.40,       # AGGRO: 40% Heat
-    "tp1_r": 0.6,                     # Schnellerer erster TP
-    "tp1_pct": 0.20,                  # Weniger rausnehmen
-    "tp2_r": 2.0,                     # Schnellerer voller TP
-    "trail_activate_r": 1.0,          # Frueherer Trail
-    "trail_atr_mult": 2.0,            # Engerer Trail
-    "pyramid_r": 1.2,                 # Frueher pyramiden
-    "pyramid_size_pct": 0.50,         # Mehr dazu
-    "max_trade_duration_hours": 3,    # Kuerzer halten
-    "max_trade_duration_min_r": 0.3,
-    "hard_timeout_hours": 5,
-    "cycle_sec": 5,                   # AGGRO: schnellerer Scan
-    "cache_ttl": 15,                  # Frischere Daten
+    "drawdown_recovery_trades": 3,
+    "portfolio_heat_max": 0.55,
+    "tp1_r": 0.5,
+    "tp1_pct": 0.15,
+    "tp2_r": 1.8,
+    "trail_activate_r": 0.8,
+    "trail_atr_mult": 1.8,
+    "pyramid_r": 1.0,
+    "pyramid_size_pct": 0.50,
+    "max_trade_duration_hours": 2,
+    "max_trade_duration_min_r": 0.2,
+    "hard_timeout_hours": 4,
+    "cycle_sec": 3,
+    "cache_ttl": 8,
     "health_ping_sec": 30,
-    "cooldown_after_win": 3,          # AGGRO: fast kein Cooldown
-    "cooldown_after_loss": 15,        # AGGRO: kurzer Cooldown
-    "cooldown_base": 5,               # AGGRO: minimal
-    "ml_retrain_hours": 3,            # Oefter trainieren
-    "ml_min_samples": 30,             # Weniger Samples noetig
-    "ml_confidence_threshold": 0.42,  # AGGRO: niedrigere Schwelle
+    "cooldown_after_win": 0,
+    "cooldown_after_loss": 3,
+    "cooldown_base": 0,
+    "ml_retrain_hours": 2,
+    "ml_min_samples": 20,
+    "ml_confidence_threshold": 0.30,
     "timeframes": ["1m", "5m", "15m", "1h"],
-    "mtf_min_score": 1.5,             # AGGRO: weniger Confluence noetig
+    "mtf_min_score": 1.0,
     "sessions": {"asia": (0, 8), "london": (8, 14), "ny": (14, 21), "off": (21, 24)},
-    "session_vol_mult": {"asia": 0.9, "london": 1.0, "ny": 1.1, "off": 0.7},
-    "funding_threshold": 0.001,       # AGGRO: hoehere Funding toleriert
-    "margin_ratio_warn": 0.15,
-    "margin_reduce_pct": 0.30,
-    "correlation_threshold": 0.85,    # AGGRO: weniger Blocking
+    "session_vol_mult": {"asia": 0.9, "london": 1.0, "ny": 1.1, "off": 0.8},
+    "funding_threshold": 0.005,
+    "margin_ratio_warn": 0.12,
+    "margin_reduce_pct": 0.25,
+    "correlation_threshold": 0.98,
     "correlation_window": 30,
     "symbols": [
         "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
         "XRP/USDT:USDT", "DOGE/USDT:USDT", "ARB/USDT:USDT",
         "AVAX/USDT:USDT", "LINK/USDT:USDT", "OP/USDT:USDT",
-        "MATIC/USDT:USDT", "ADA/USDT:USDT", "DOT/USDT:USDT",
+        "POL/USDT:USDT", "ADA/USDT:USDT", "DOT/USDT:USDT",
         "NEAR/USDT:USDT", "APT/USDT:USDT", "SUI/USDT:USDT",
         "WIF/USDT:USDT", "PEPE/USDT:USDT", "FET/USDT:USDT",
     ],
-    "dash_port": 8080,
+    "dash_port": 9090,
     "dash_host": "0.0.0.0",
     "webhook_port": 8081,
     "db_path": "olympus.db",
@@ -764,11 +764,15 @@ async def update_correlations():
         return
     returns_data = {}
     for symbol in CFG["symbols"]:
-        candles = await fetch_ohlcv(symbol, "1h", CFG["correlation_window"] + 1)
-        if candles and len(candles) > 10:
-            closes = [c[4] for c in candles]
-            rets = [(closes[i] - closes[i - 1]) / closes[i - 1] for i in range(1, len(closes))]
-            returns_data[symbol] = rets
+        try:
+            candles = await fetch_ohlcv(symbol, "1h", CFG["correlation_window"] + 1)
+            if candles and len(candles) > 10:
+                closes = [c[4] for c in candles]
+                rets = [(closes[i] - closes[i - 1]) / closes[i - 1] for i in range(1, len(closes))]
+                returns_data[symbol] = rets
+        except Exception as e:
+            log.debug("correlation skip %s: %s", symbol, e)
+            continue
     sym_list = list(returns_data.keys())
     correlation_matrix = {}
     for i, s1 in enumerate(sym_list):
@@ -922,7 +926,7 @@ async def strategy_trend(symbol, candles):
     if not ema9 or not ema21 or not ema50:
         return None
     adx = calc_adx(highs, lows, closes)
-    if adx < 20:
+    if adx < 10:
         return None
     atr = calc_atr(highs, lows, closes)
     price = closes[-1]
@@ -949,12 +953,12 @@ async def strategy_momentum(symbol, candles):
     _, _, hist = calc_macd(closes)
     atr = calc_atr(highs, lows, closes)
     price = closes[-1]
-    if rsi < 30 and hist > 0:
+    if rsi < 40 and hist > 0:
         div = detect_rsi_divergence(closes)
         conf = 0.7 if div == "bullish" else 0.6
         return {"side": "buy", "strategy": "momentum", "confidence": conf,
                 "sl": price - 1.8 * atr, "tp": price + 2.5 * atr, "atr": atr}
-    if rsi > 70 and hist < 0:
+    if rsi > 60 and hist < 0:
         div = detect_rsi_divergence(closes)
         conf = 0.7 if div == "bearish" else 0.6
         return {"side": "sell", "strategy": "momentum", "confidence": conf,
@@ -974,7 +978,7 @@ async def strategy_breakout(symbol, candles):
     high_20 = max(highs[-21:-1])
     low_20 = min(lows[-21:-1])
     avg_vol = sum(volumes[-20:]) / 20 if volumes else 1
-    vol_spike = volumes[-1] > avg_vol * 1.5
+    vol_spike = volumes[-1] > avg_vol * 1.1
     if price > high_20 and vol_spike:
         return {"side": "buy", "strategy": "breakout", "confidence": 0.65,
                 "sl": price - 2.0 * atr, "tp": price + 3.5 * atr, "atr": atr}
@@ -994,10 +998,10 @@ async def strategy_scalp(symbol, candles):
     price = closes[-1]
     bb_u, bb_m, bb_l = calc_bbands(closes)
     rsi = calc_rsi(closes, 7)
-    if price <= bb_l and rsi < 25:
+    if price <= bb_l and rsi < 35:
         return {"side": "buy", "strategy": "scalp", "confidence": 0.6,
                 "sl": price - 1.2 * atr, "tp": bb_m, "atr": atr}
-    if price >= bb_u and rsi > 75:
+    if price >= bb_u and rsi > 65:
         return {"side": "sell", "strategy": "scalp", "confidence": 0.6,
                 "sl": price + 1.2 * atr, "tp": bb_m, "atr": atr}
     return None
@@ -1939,8 +1943,16 @@ async def main_loop():
     await warmup_ml()
     await update_correlations()
 
-    dash_runner = await start_dashboard()
-    wh_runner = await start_webhook()
+    try:
+        dash_runner = await start_dashboard()
+    except Exception as e:
+        log.warning("Dashboard failed (port busy?): %s", e)
+        dash_runner = None
+    try:
+        wh_runner = await start_webhook()
+    except Exception as e:
+        log.warning("Webhook failed: %s", e)
+        wh_runner = None
     tg_app = await setup_telegram()
 
     if tg_app:
