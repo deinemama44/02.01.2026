@@ -75,13 +75,57 @@ CFG = {
     "correlation_threshold": 0.85,    # AGGRO: weniger Blocking
     "correlation_window": 30,
     "symbols": [
+        # Majors
         "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
-        "XRP/USDT:USDT", "DOGE/USDT:USDT", "ARB/USDT:USDT",
-        "AVAX/USDT:USDT", "LINK/USDT:USDT", "OP/USDT:USDT",
-        "MATIC/USDT:USDT", "ADA/USDT:USDT", "DOT/USDT:USDT",
-        "NEAR/USDT:USDT", "APT/USDT:USDT", "SUI/USDT:USDT",
-        "WIF/USDT:USDT", "PEPE/USDT:USDT", "FET/USDT:USDT",
+        "BNB/USDT:USDT", "XRP/USDT:USDT", "ADA/USDT:USDT",
+        # Layer1 / Layer2
+        "AVAX/USDT:USDT", "DOT/USDT:USDT", "NEAR/USDT:USDT",
+        "APT/USDT:USDT", "SUI/USDT:USDT", "TIA/USDT:USDT",
+        "INJ/USDT:USDT", "ATOM/USDT:USDT", "ARB/USDT:USDT",
+        "OP/USDT:USDT", "MATIC/USDT:USDT", "STRK/USDT:USDT",
+        "SEI/USDT:USDT", "TON/USDT:USDT",
+        # DeFi / Infra
+        "LINK/USDT:USDT", "UNI/USDT:USDT", "AAVE/USDT:USDT",
+        "LDO/USDT:USDT", "FET/USDT:USDT", "RNDR/USDT:USDT",
+        "DYDX/USDT:USDT", "GMX/USDT:USDT",
+        # Memes / Hot
+        "DOGE/USDT:USDT", "WIF/USDT:USDT", "PEPE/USDT:USDT",
+        "BONK/USDT:USDT", "FLOKI/USDT:USDT", "SHIB/USDT:USDT",
+        "ORDI/USDT:USDT",
+        # Oldies but Goldies
+        "LTC/USDT:USDT", "BCH/USDT:USDT", "ETC/USDT:USDT",
+        "TRX/USDT:USDT", "FIL/USDT:USDT", "ICP/USDT:USDT",
     ],
+    # ----- News -----
+    "news_enabled": True,
+    "news_check_sec": 300,                 # alle 5 min
+    "news_lookback_min": 60,               # 60 min relevant
+    "news_alert_importance": 7,            # >=7/10 -> Telegram
+    "news_sentiment_window": 30,           # min news im Sentiment-Pool
+    # ----- Liquidations -----
+    "liq_enabled": True,
+    "liq_check_sec": 60,
+    "liq_alert_usd": 1_000_000,            # >=1M USDT cluster -> Alert
+    "liq_hunt_threshold_usd": 500_000,     # Konter-Trade Schwelle
+    "liq_hunt_window_sec": 180,            # Liq < 3 min alt
+    # ----- Open Interest -----
+    "oi_enabled": True,
+    "oi_check_sec": 300,
+    "oi_change_threshold": 0.04,           # 4% in 1h = signifikant
+    "oi_history_max": 24,                  # 24 snapshots
+    # ----- Long/Short Ratio -----
+    "lsr_enabled": True,
+    "lsr_check_sec": 600,
+    "lsr_extreme_threshold": 2.5,          # >2.5 oder <0.4 = extrem
+    # ----- Sentiment -----
+    "sentiment_size_boost_max": 1.25,      # bis +25% Size
+    "sentiment_size_cut_min": 0.5,         # bis -50% Size
+    # ----- Telegram-Reporting -----
+    "tg_hourly_summary": True,
+    "tg_summary_interval_sec": 3600,
+    "tg_top_n": 10,
+    # ----- Symbol-Ranking -----
+    "rank_top_n": 25,                      # nur Top-25 pro Cycle scannen
     "dash_port": 8080,
     "dash_host": "0.0.0.0",
     "webhook_port": 8081,
@@ -137,6 +181,7 @@ TG_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 DASH_TOKEN = os.environ.get("DASHBOARD_TOKEN", "olympus_secret_token")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+CRYPTOPANIC_TOKEN = os.environ.get("CRYPTOPANIC_TOKEN", "")  # optional
 
 if not WEBHOOK_SECRET:
     log.warning("WEBHOOK_SECRET not set - webhook disabled")
@@ -171,6 +216,24 @@ active_trades: Dict[str, Dict] = {}
 grid_levels: Dict[str, List[Dict]] = {}
 shutdown_event = None
 last_health_ping = 0.0
+
+# ----- News / Sentiment / Liquidations / OI / LSR -----
+news_cache: List[Dict] = []                     # latest news items
+last_news_check = 0.0
+last_news_alert_id = ""                         # avoid spam
+liquidations_log: deque = deque(maxlen=500)     # recent liqs
+last_liq_check = 0.0
+last_liq_alert_ts = 0.0
+oi_history: Dict[str, deque] = {}               # symbol -> deque of (ts, oi)
+last_oi_check = 0.0
+ls_ratio: Dict[str, float] = {}                 # symbol -> long/short
+last_lsr_check = 0.0
+sentiment_score = 0.0                           # global market sentiment [-1..+1]
+symbol_sentiment: Dict[str, float] = {}         # per-symbol [-1..+1]
+last_hourly_summary = 0.0
+strategy_stats: Dict[str, Dict[str, float]] = {}  # per-strategy pnl/wins/losses
+risk_override: Optional[float] = None           # manual /setrisk
+symbol_blacklist: set = set()
 
 
 # ===========================================================================
@@ -428,6 +491,33 @@ async def init_exchange():
     except Exception as e:
         log.error("Market load failed: %s", e)
 
+    # FIX Bitget 40774: account is in hedge mode but we send one-way orders.
+    # Try to switch account to one-way mode (so we don't need holdSide param).
+    try:
+        await exchange.set_position_mode(False)  # False = one-way / unilateral
+        log.info("Bitget position mode: one-way (unilateral)")
+    except Exception as e:
+        # Some Bitget versions need productType param; we will fall back to
+        # supplying holdSide manually in place_order.
+        log.warning("set_position_mode failed (%s) - will use holdSide fallback", e)
+
+
+def _bitget_hold_side(side: str, params: Optional[Dict] = None) -> Dict:
+    """Build Bitget v2 params with holdSide for hedge-mode accounts.
+
+    side='buy' -> long, 'sell' -> short. If reduceOnly=True, holdSide is the
+    side of the EXISTING position (opposite of the close order).
+    """
+    p = dict(params or {})
+    if p.get("reduceOnly"):
+        # closing a long uses sell with holdSide=long; closing a short uses buy with holdSide=short
+        p["holdSide"] = "long" if side == "sell" else "short"
+        p.setdefault("tradeSide", "close")
+    else:
+        p["holdSide"] = "long" if side == "buy" else "short"
+        p.setdefault("tradeSide", "open")
+    return p
+
 
 async def close_exchange():
     if exchange:
@@ -537,11 +627,23 @@ async def set_leverage(symbol: str, leverage: int):
 async def place_order(symbol, side, amount, order_type="market", price=None, params=None):
     if not exchange:
         return None
+    params = params or {}
     try:
-        params = params or {}
         order = await exchange.create_order(symbol, order_type, side, amount, price, params)
         return order
     except Exception as e:
+        msg = str(e)
+        # Bitget 40774: hedge-mode account needs holdSide. Auto-retry with it.
+        if "40774" in msg or "unilateral position" in msg:
+            try:
+                p2 = _bitget_hold_side(side, params)
+                log.info("Retrying %s with holdSide=%s tradeSide=%s",
+                         symbol, p2.get("holdSide"), p2.get("tradeSide"))
+                order = await exchange.create_order(symbol, order_type, side, amount, price, p2)
+                return order
+            except Exception as e2:
+                log.error("place_order(retry) %s %s %s: %s", symbol, side, amount, e2)
+                return None
         log.error("place_order %s %s %s: %s", symbol, side, amount, e)
         return None
 
@@ -715,6 +817,483 @@ def detect_rsi_divergence(closes, period=14) -> str:
             rsi_vals[-1] < max(rsi_vals[-10:-1])):
         return "bearish"
     return "none"
+
+
+# ===========================================================================
+# NEWS / LIQUIDATIONS / OI / LSR / SENTIMENT (NEW)
+# ===========================================================================
+
+# Symbol -> base ticker (e.g. "BTC/USDT:USDT" -> "BTC")
+def _base_of(symbol: str) -> str:
+    try:
+        return symbol.split("/")[0].upper()
+    except Exception:
+        return symbol
+
+
+# Bullish / bearish keyword maps for news sentiment
+_BULL_KW = (
+    "approve", "approval", "etf", "bullish", "rally", "surge", "soar",
+    "moon", "all-time high", "ath", "partnership", "adopt", "adoption",
+    "upgrade", "burn", "buyback", "institutional", "inflow", "halving",
+    "pump", "breakout", "listing", "listed", "launch", "mainnet",
+)
+_BEAR_KW = (
+    "hack", "exploit", "rug", "scam", "lawsuit", "sue", "ban", "banned",
+    "outflow", "dump", "crash", "plunge", "bearish", "investigation",
+    "fraud", "default", "liquidat", "sell-off", "selloff", "halt",
+    "delist", "delisted", "exploit", "vulnerab", "downtime",
+)
+
+
+def _score_text(text: str) -> int:
+    """+1 per bullish word, -1 per bearish. Returns net score."""
+    if not text:
+        return 0
+    t = text.lower()
+    s = 0
+    for kw in _BULL_KW:
+        if kw in t:
+            s += 1
+    for kw in _BEAR_KW:
+        if kw in t:
+            s -= 1
+    return s
+
+
+async def fetch_news() -> List[Dict]:
+    """Pull crypto news from CryptoPanic (free) - parsed for sentiment."""
+    global news_cache, last_news_check
+    if not CFG["news_enabled"]:
+        return []
+    now = time.time()
+    if now - last_news_check < CFG["news_check_sec"]:
+        return news_cache
+    last_news_check = now
+    try:
+        import aiohttp
+    except ImportError:
+        return news_cache
+    base = "https://cryptopanic.com/api/v1/posts/"
+    params = {"public": "true", "kind": "news"}
+    if CRYPTOPANIC_TOKEN:
+        params["auth_token"] = CRYPTOPANIC_TOKEN
+        params.pop("public", None)
+    qs = "&".join(f"{k}={v}" for k, v in params.items())
+    url = f"{base}?{qs}"
+    items: List[Dict] = []
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    log.debug("cryptopanic %d", resp.status)
+                    return news_cache
+                data = await resp.json()
+        for r in data.get("results", []):
+            title = r.get("title", "") or ""
+            currencies = [c.get("code", "") for c in (r.get("currencies") or [])]
+            published = r.get("published_at", "")
+            votes = r.get("votes") or {}
+            importance = (votes.get("important", 0) or 0) + (votes.get("positive", 0) or 0) + (votes.get("negative", 0) or 0)
+            score = _score_text(title)
+            # CryptoPanic vote-based hints
+            if (votes.get("positive", 0) or 0) > (votes.get("negative", 0) or 0):
+                score += 1
+            elif (votes.get("negative", 0) or 0) > (votes.get("positive", 0) or 0):
+                score -= 1
+            items.append({
+                "id": r.get("id") or r.get("slug", title[:30]),
+                "title": title,
+                "url": r.get("url", ""),
+                "source": (r.get("source") or {}).get("title", ""),
+                "currencies": currencies,
+                "published": published,
+                "importance": importance,
+                "score": score,
+                "ts": now,
+            })
+    except Exception as e:
+        log.debug("fetch_news error: %s", e)
+        return news_cache
+    # keep latest 200
+    news_cache = items[:200]
+    log.info("News refreshed: %d items", len(news_cache))
+    return news_cache
+
+
+def news_for_symbol(symbol: str, lookback_sec: Optional[int] = None) -> List[Dict]:
+    """Filter news cache for a symbol."""
+    base = _base_of(symbol)
+    cutoff = time.time() - (lookback_sec or CFG["news_lookback_min"] * 60)
+    out = []
+    for n in news_cache:
+        if n["ts"] < cutoff:
+            continue
+        if base in [c.upper() for c in n.get("currencies", [])]:
+            out.append(n)
+    return out
+
+
+def compute_symbol_sentiment(symbol: str) -> float:
+    """Aggregate per-symbol sentiment in [-1, +1] from recent news."""
+    items = news_for_symbol(symbol)
+    if not items:
+        return 0.0
+    total = sum(i["score"] for i in items)
+    norm = max(1, len(items) * 2)  # rough normalisation
+    val = max(-1.0, min(1.0, total / norm))
+    return val
+
+
+def compute_market_sentiment() -> float:
+    """Global market sentiment from all recent news, in [-1, +1]."""
+    if not news_cache:
+        return 0.0
+    cutoff = time.time() - CFG["news_lookback_min"] * 60
+    recent = [n for n in news_cache if n["ts"] >= cutoff]
+    if not recent:
+        return 0.0
+    total = sum(n["score"] for n in recent)
+    norm = max(1, len(recent) * 2)
+    return max(-1.0, min(1.0, total / norm))
+
+
+async def refresh_sentiment():
+    """Refresh symbol+market sentiment caches."""
+    global sentiment_score, symbol_sentiment
+    sentiment_score = compute_market_sentiment()
+    new_map = {}
+    for sym in CFG["symbols"]:
+        new_map[sym] = compute_symbol_sentiment(sym)
+    symbol_sentiment = new_map
+
+
+async def fetch_liquidations():
+    """Binance USDT-M public liquidation WebSocket (free, real-time).
+
+    Connects once and streams forced-order events. Since main loop calls this
+    repeatedly, we keep a singleton task that runs until shutdown.
+    """
+    global last_liq_check
+    if not CFG["liq_enabled"]:
+        return
+    last_liq_check = time.time()
+    if getattr(fetch_liquidations, "_running", False):
+        return
+    fetch_liquidations._running = True
+
+    async def _stream():
+        try:
+            import aiohttp
+        except ImportError:
+            return
+        url = "wss://fstream.binance.com/ws/!forceOrder@arr"
+        backoff = 1
+        while not (shutdown_event and shutdown_event.is_set()):
+            try:
+                timeout = aiohttp.ClientTimeout(total=None, sock_read=30)
+                async with aiohttp.ClientSession(timeout=timeout) as sess:
+                    async with sess.ws_connect(url, heartbeat=60) as ws:
+                        log.info("Liq stream connected")
+                        backoff = 1
+                        async for msg in ws:
+                            if msg.type != aiohttp.WSMsgType.TEXT:
+                                continue
+                            try:
+                                payload = json.loads(msg.data)
+                                o = payload.get("o", payload)
+                                sym_raw = o.get("s", "")
+                                if not sym_raw.endswith("USDT"):
+                                    continue
+                                base = sym_raw[:-4]
+                                price = float(o.get("ap", o.get("p", 0)) or 0)
+                                qty = float(o.get("q", 0) or 0)
+                                value = price * qty
+                                if value < 5_000:
+                                    continue
+                                # SELL liq = long got rekt; BUY liq = short got rekt
+                                side = "long" if o.get("S") == "SELL" else "short"
+                                ts = float(o.get("T", time.time() * 1000)) / 1000.0
+                                liquidations_log.append({
+                                    "symbol": f"{base}/USDT:USDT",
+                                    "side": side, "price": price, "qty": qty,
+                                    "value_usd": value, "ts": ts,
+                                    "source": "binance_ws",
+                                })
+                            except Exception:
+                                continue
+            except Exception as e:
+                log.debug("Liq stream error: %s, retry in %ds", e, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(60, backoff * 2)
+
+    asyncio.create_task(_stream())
+
+
+def liq_cluster_for(symbol: str, window_sec: int = None) -> Tuple[float, float]:
+    """Sum (long-liq-value, short-liq-value) for symbol in window."""
+    window_sec = window_sec or CFG["liq_hunt_window_sec"]
+    cutoff = time.time() - window_sec
+    long_val, short_val = 0.0, 0.0
+    for l in liquidations_log:
+        if l["symbol"] != symbol or l["ts"] < cutoff:
+            continue
+        if l["side"] == "long":
+            long_val += l["value_usd"]
+        else:
+            short_val += l["value_usd"]
+    return long_val, short_val
+
+
+def total_liq_window(window_sec: int = 300) -> Dict[str, float]:
+    """Total liq value per symbol in window."""
+    cutoff = time.time() - window_sec
+    out: Dict[str, float] = {}
+    for l in liquidations_log:
+        if l["ts"] < cutoff:
+            continue
+        out[l["symbol"]] = out.get(l["symbol"], 0) + l["value_usd"]
+    return out
+
+
+async def fetch_open_interest_all():
+    """Snapshot OI for all symbols and store history."""
+    global last_oi_check
+    if not CFG["oi_enabled"] or not exchange:
+        return
+    now = time.time()
+    if now - last_oi_check < CFG["oi_check_sec"]:
+        return
+    last_oi_check = now
+    if not hasattr(exchange, "fetch_open_interest"):
+        return
+    for sym in CFG["symbols"]:
+        try:
+            oi = await exchange.fetch_open_interest(sym)
+            value = float(oi.get("openInterestAmount", 0) or oi.get("openInterestValue", 0) or 0)
+            if value <= 0:
+                continue
+            if sym not in oi_history:
+                oi_history[sym] = deque(maxlen=CFG["oi_history_max"])
+            oi_history[sym].append((now, value))
+        except Exception:
+            continue
+
+
+def oi_change(symbol: str, lookback_sec: int = 3600) -> float:
+    """Returns relative OI change over lookback. 0 if no data."""
+    hist = oi_history.get(symbol)
+    if not hist or len(hist) < 2:
+        return 0.0
+    now = time.time()
+    cutoff = now - lookback_sec
+    older = None
+    for t, v in hist:
+        if t >= cutoff:
+            older = (t, v)
+            break
+    if older is None:
+        older = hist[0]
+    latest = hist[-1]
+    if older[1] <= 0:
+        return 0.0
+    return (latest[1] - older[1]) / older[1]
+
+
+async def fetch_long_short_ratio():
+    """Pull global long/short account ratio from Binance for major pairs."""
+    global last_lsr_check
+    if not CFG["lsr_enabled"]:
+        return
+    now = time.time()
+    if now - last_lsr_check < CFG["lsr_check_sec"]:
+        return
+    last_lsr_check = now
+    try:
+        import aiohttp
+    except ImportError:
+        return
+    base_url = "https://fapi.binance.com/futures/data/globalLongShortAccountRatio"
+    async with aiohttp.ClientSession() as session:
+        for sym in CFG["symbols"]:
+            base = _base_of(sym)
+            params = f"symbol={base}USDT&period=15m&limit=1"
+            try:
+                async with session.get(f"{base_url}?{params}", timeout=aiohttp.ClientTimeout(total=6)) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                if data and isinstance(data, list):
+                    ls_ratio[sym] = float(data[0].get("longShortRatio", 1.0))
+            except Exception:
+                continue
+            await asyncio.sleep(0.05)  # be nice
+
+
+async def fetch_top_trader_ratio():
+    """Smart Money: Binance topLongShortPositionRatio (FREE, public).
+
+    Top-trader position ratio shows what large/pro traders are positioned.
+    Stored in ls_ratio[symbol+'_top'].
+    """
+    if not CFG["lsr_enabled"]:
+        return
+    try:
+        import aiohttp
+    except ImportError:
+        return
+    base_url = "https://fapi.binance.com/futures/data/topLongShortPositionRatio"
+    async with aiohttp.ClientSession() as session:
+        for sym in CFG["symbols"]:
+            base = _base_of(sym)
+            params = f"symbol={base}USDT&period=15m&limit=1"
+            try:
+                async with session.get(f"{base_url}?{params}", timeout=aiohttp.ClientTimeout(total=6)) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                if data and isinstance(data, list):
+                    ls_ratio[sym + "_top"] = float(data[0].get("longShortRatio", 1.0))
+            except Exception:
+                continue
+            await asyncio.sleep(0.05)
+
+
+async def fetch_taker_ratio():
+    """Aggressive Buy/Sell Pressure: Binance takerlongshortRatio (FREE, public).
+
+    Taker buy/sell volume ratio - shows aggressor side.
+    >1 = buyers aggressive, <1 = sellers aggressive.
+    Stored in ls_ratio[symbol+'_taker'].
+    """
+    if not CFG["lsr_enabled"]:
+        return
+    try:
+        import aiohttp
+    except ImportError:
+        return
+    base_url = "https://fapi.binance.com/futures/data/takerlongshortRatio"
+    async with aiohttp.ClientSession() as session:
+        for sym in CFG["symbols"]:
+            base = _base_of(sym)
+            params = f"symbol={base}USDT&period=5m&limit=1"
+            try:
+                async with session.get(f"{base_url}?{params}", timeout=aiohttp.ClientTimeout(total=6)) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                if data and isinstance(data, list):
+                    ls_ratio[sym + "_taker"] = float(data[0].get("buySellRatio", 1.0))
+            except Exception:
+                continue
+            await asyncio.sleep(0.05)
+
+
+async def fetch_oi_history_binance():
+    """Pull Binance public OI history (better than ccxt for trend detection)."""
+    if not CFG["oi_enabled"]:
+        return
+    try:
+        import aiohttp
+    except ImportError:
+        return
+    base_url = "https://fapi.binance.com/futures/data/openInterestHist"
+    async with aiohttp.ClientSession() as session:
+        for sym in CFG["symbols"]:
+            base = _base_of(sym)
+            params = f"symbol={base}USDT&period=15m&limit=8"  # 2h history
+            try:
+                async with session.get(f"{base_url}?{params}", timeout=aiohttp.ClientTimeout(total=6)) as resp:
+                    if resp.status != 200:
+                        continue
+                    data = await resp.json()
+                if not isinstance(data, list):
+                    continue
+                if sym not in oi_history:
+                    oi_history[sym] = deque(maxlen=CFG["oi_history_max"])
+                oi_history[sym].clear()
+                for entry in data:
+                    ts = float(entry.get("timestamp", 0)) / 1000.0
+                    val = float(entry.get("sumOpenInterest", 0))
+                    if val > 0:
+                        oi_history[sym].append((ts, val))
+            except Exception:
+                continue
+            await asyncio.sleep(0.05)
+
+
+async def order_book_imbalance(symbol: str, depth: int = 20) -> float:
+    """Order Flow Imbalance: (bids - asks) / (bids + asks) on top N levels.
+
+    +1 = pure buying pressure, -1 = pure selling pressure.
+    """
+    if not exchange:
+        return 0.0
+    try:
+        ob = await exchange.fetch_order_book(symbol, limit=depth)
+        bids = sum(b[1] for b in ob.get("bids", [])[:depth])
+        asks = sum(a[1] for a in ob.get("asks", [])[:depth])
+        if bids + asks <= 0:
+            return 0.0
+        return (bids - asks) / (bids + asks)
+    except Exception:
+        return 0.0
+
+
+def smart_money_bias(symbol: str) -> float:
+    """Combine top-trader ratio + taker ratio into [-1, +1] bias.
+
+    > 0 = smart money / aggressors leaning long
+    < 0 = leaning short
+    """
+    top = ls_ratio.get(symbol + "_top", 0.0)
+    tak = ls_ratio.get(symbol + "_taker", 0.0)
+    parts = []
+    if top > 0:
+        # log-scale around 1.0 -> bias
+        parts.append(max(-1.0, min(1.0, math.log(top + 1e-9))))
+    if tak > 0:
+        parts.append(max(-1.0, min(1.0, math.log(tak + 1e-9))))
+    if not parts:
+        return 0.0
+    return sum(parts) / len(parts)
+
+
+def opportunity_score(symbol: str, candles: List) -> float:
+    """Rank symbol by trading opportunity. Higher = better.
+
+    Combines: volatility, trend, vol-spike, sentiment, liquidation-cluster,
+    OI change, and smart-money bias.
+    """
+    if not candles or len(candles) < 30:
+        return 0.0
+    closes = [c[4] for c in candles]
+    highs = [c[2] for c in candles]
+    lows = [c[3] for c in candles]
+    volumes = [c[5] for c in candles]
+    atr = calc_atr(highs, lows, closes)
+    price = closes[-1]
+    if price <= 0:
+        return 0.0
+    atr_pct = atr / price
+    adx = calc_adx(highs, lows, closes)
+    avg_vol = sum(volumes[-20:]) / 20 if len(volumes) >= 20 else 1
+    vol_spike = volumes[-1] / avg_vol if avg_vol > 0 else 1
+    sent = symbol_sentiment.get(symbol, 0.0)
+    long_liq, short_liq = liq_cluster_for(symbol)
+    liq_factor = (long_liq + short_liq) / 100_000
+    oi_chg = abs(oi_change(symbol))
+    smart = abs(smart_money_bias(symbol))
+    score = (
+        atr_pct * 100 * 1.5
+        + adx / 25.0
+        + min(vol_spike, 5) * 0.5
+        + abs(sent) * 1.5
+        + min(liq_factor, 50) * 0.05
+        + oi_chg * 30
+        + smart * 1.5
+    )
+    return score
 
 
 # ===========================================================================
@@ -1032,7 +1611,142 @@ async def strategy_reversal(symbol, candles):
     return None
 
 
-ALL_STRATEGIES = [strategy_trend, strategy_momentum, strategy_breakout, strategy_scalp, strategy_reversal]
+async def strategy_liquidation_hunt(symbol, candles):
+    """Fade after a one-sided liquidation cascade.
+
+    Big long-liqs in last 3min -> fade DOWN move with LONG (short squeeze setup).
+    Big short-liqs -> fade UP move with SHORT.
+    """
+    if len(candles) < 30:
+        return None
+    long_liq, short_liq = liq_cluster_for(symbol)
+    threshold = CFG["liq_hunt_threshold_usd"]
+    if long_liq < threshold and short_liq < threshold:
+        return None
+    closes = [c[4] for c in candles]
+    highs = [c[2] for c in candles]
+    lows = [c[3] for c in candles]
+    atr = calc_atr(highs, lows, closes)
+    price = closes[-1]
+    rsi = calc_rsi(closes, 7)
+    # Long-liqs > 2x short-liqs and price already crashed -> fade up
+    if long_liq > short_liq * 2 and long_liq >= threshold and rsi < 35:
+        conf = min(0.85, 0.55 + long_liq / 5_000_000)
+        return {"side": "buy", "strategy": "liq_hunt", "confidence": conf,
+                "sl": price - 1.4 * atr, "tp": price + 2.5 * atr, "atr": atr,
+                "meta": {"long_liq": long_liq, "short_liq": short_liq}}
+    if short_liq > long_liq * 2 and short_liq >= threshold and rsi > 65:
+        conf = min(0.85, 0.55 + short_liq / 5_000_000)
+        return {"side": "sell", "strategy": "liq_hunt", "confidence": conf,
+                "sl": price + 1.4 * atr, "tp": price - 2.5 * atr, "atr": atr,
+                "meta": {"long_liq": long_liq, "short_liq": short_liq}}
+    return None
+
+
+async def strategy_news_momentum(symbol, candles):
+    """Trade fresh strong news in direction of sentiment with confluence."""
+    if len(candles) < 30:
+        return None
+    items = news_for_symbol(symbol, lookback_sec=30 * 60)
+    if not items:
+        return None
+    # need a clearly directional cluster
+    score_sum = sum(i["score"] for i in items)
+    if abs(score_sum) < 2:
+        return None
+    closes = [c[4] for c in candles]
+    highs = [c[2] for c in candles]
+    lows = [c[3] for c in candles]
+    atr = calc_atr(highs, lows, closes)
+    price = closes[-1]
+    _, _, hist = calc_macd(closes)
+    avg_vol = sum(c[5] for c in candles[-20:]) / 20 if len(candles) >= 20 else 1
+    vol_ok = candles[-1][5] > avg_vol * 1.2
+    if score_sum >= 2 and hist > 0 and vol_ok:
+        conf = min(0.85, 0.55 + min(score_sum, 6) * 0.05)
+        return {"side": "buy", "strategy": "news_momo", "confidence": conf,
+                "sl": price - 1.8 * atr, "tp": price + 3.0 * atr, "atr": atr,
+                "meta": {"news_score": score_sum, "news_count": len(items)}}
+    if score_sum <= -2 and hist < 0 and vol_ok:
+        conf = min(0.85, 0.55 + min(abs(score_sum), 6) * 0.05)
+        return {"side": "sell", "strategy": "news_momo", "confidence": conf,
+                "sl": price + 1.8 * atr, "tp": price - 3.0 * atr, "atr": atr,
+                "meta": {"news_score": score_sum, "news_count": len(items)}}
+    return None
+
+
+async def strategy_oi_divergence(symbol, candles):
+    """Open Interest divergence: rising OI + breakout = strong continuation.
+
+    OI up + price up = longs piling in, ride
+    OI up + price down = shorts piling in, fade or short
+    OI down + move = position unwinding, weaker
+    """
+    if len(candles) < 30:
+        return None
+    oi_chg = oi_change(symbol)
+    if abs(oi_chg) < CFG["oi_change_threshold"]:
+        return None
+    closes = [c[4] for c in candles]
+    highs = [c[2] for c in candles]
+    lows = [c[3] for c in candles]
+    atr = calc_atr(highs, lows, closes)
+    price = closes[-1]
+    if len(closes) < 6:
+        return None
+    price_chg = (closes[-1] - closes[-6]) / closes[-6] if closes[-6] > 0 else 0
+    # Strong OI growth in trend direction = momentum
+    if oi_chg > CFG["oi_change_threshold"] and price_chg > 0.005:
+        conf = min(0.8, 0.55 + oi_chg * 3)
+        return {"side": "buy", "strategy": "oi_div", "confidence": conf,
+                "sl": price - 1.8 * atr, "tp": price + 3.2 * atr, "atr": atr,
+                "meta": {"oi_change": oi_chg}}
+    if oi_chg > CFG["oi_change_threshold"] and price_chg < -0.005:
+        # OI grows while price falls -> aggressive shorts, ride down
+        conf = min(0.8, 0.55 + oi_chg * 3)
+        return {"side": "sell", "strategy": "oi_div", "confidence": conf,
+                "sl": price + 1.8 * atr, "tp": price - 3.2 * atr, "atr": atr,
+                "meta": {"oi_change": oi_chg}}
+    return None
+
+
+async def strategy_smart_money(symbol, candles):
+    """Follow top-trader position bias + taker pressure confluence."""
+    if len(candles) < 30:
+        return None
+    bias = smart_money_bias(symbol)
+    if abs(bias) < 0.2:  # no clear edge
+        return None
+    closes = [c[4] for c in candles]
+    highs = [c[2] for c in candles]
+    lows = [c[3] for c in candles]
+    atr = calc_atr(highs, lows, closes)
+    price = closes[-1]
+    ema21 = calc_ema(closes, 21)
+    if not ema21:
+        return None
+    above_ema = closes[-1] > ema21[-1]
+    rsi = calc_rsi(closes)
+    # Bias up + price above EMA + RSI not overbought
+    if bias > 0.25 and above_ema and rsi < 70:
+        conf = min(0.85, 0.55 + bias * 0.5)
+        return {"side": "buy", "strategy": "smart_money", "confidence": conf,
+                "sl": price - 1.8 * atr, "tp": price + 2.8 * atr, "atr": atr,
+                "meta": {"bias": bias}}
+    if bias < -0.25 and not above_ema and rsi > 30:
+        conf = min(0.85, 0.55 + abs(bias) * 0.5)
+        return {"side": "sell", "strategy": "smart_money", "confidence": conf,
+                "sl": price + 1.8 * atr, "tp": price - 2.8 * atr, "atr": atr,
+                "meta": {"bias": bias}}
+    return None
+
+
+ALL_STRATEGIES = [
+    strategy_trend, strategy_momentum, strategy_breakout,
+    strategy_scalp, strategy_reversal,
+    strategy_liquidation_hunt, strategy_news_momentum,
+    strategy_oi_divergence, strategy_smart_money,
+]
 
 
 # ===========================================================================
@@ -1040,18 +1754,39 @@ ALL_STRATEGIES = [strategy_trend, strategy_momentum, strategy_breakout, strategy
 # ===========================================================================
 
 
-async def kelly_size(confidence: float, equity: float) -> float:
-    """Kelly with actual win rate (Bug #16), session adjust (Feature #2), recovery (Feature #7)."""
+async def kelly_size(confidence: float, equity: float, signal: Optional[Dict] = None) -> float:
+    """Kelly + session + recovery + sentiment bias for sizing."""
     win_rate = await db_win_rate() if db else ml_win_rate
     if win_rate <= 0 or win_rate >= 1:
         win_rate = 0.5
     avg_r = 1.5
     kelly = win_rate - (1 - win_rate) / avg_r
     kelly = max(0.01, min(kelly, 0.25))
-    size_pct = kelly * confidence * CFG["risk_per_trade"] / 0.02
+    base_risk = risk_override if risk_override is not None else CFG["risk_per_trade"]
+    size_pct = kelly * confidence * base_risk / 0.02
     size_pct *= session_size_mult()
     if drawdown_recovery_remaining > 0:
         size_pct *= CFG["drawdown_recovery_size_mult"]
+
+    # Sentiment-aligned sizing boost / cut
+    if signal:
+        sym = signal.get("_symbol")
+        side = signal.get("side")
+        sym_sent = symbol_sentiment.get(sym, 0.0) if sym else 0.0
+        global_sent = sentiment_score
+        # Aligned sentiment -> boost; misaligned -> cut
+        if side == "buy":
+            aligned = (sym_sent > 0.1) or (global_sent > 0.2)
+            misaligned = (sym_sent < -0.3) or (global_sent < -0.4)
+        else:
+            aligned = (sym_sent < -0.1) or (global_sent < -0.2)
+            misaligned = (sym_sent > 0.3) or (global_sent > 0.4)
+        if aligned:
+            size_pct *= min(CFG["sentiment_size_boost_max"],
+                            1.0 + abs(sym_sent) * 0.25 + abs(global_sent) * 0.15)
+        if misaligned:
+            size_pct *= max(CFG["sentiment_size_cut_min"], 0.7)
+
     size_pct = min(size_pct, CFG["max_risk_per_trade"])
     return equity * size_pct
 
@@ -1108,7 +1843,9 @@ async def open_trade(symbol, signal, equity):
     if sl_dist <= 0:
         sl_dist = atr * 1.5
 
-    risk_amount = await kelly_size(confidence, equity)
+    # pass symbol so kelly_size can apply sentiment boost
+    signal["_symbol"] = symbol
+    risk_amount = await kelly_size(confidence, equity, signal)
     atr_pct = atr / price if price > 0 else 0.01
     leverage = calc_leverage(confidence, atr_pct)
 
@@ -1126,7 +1863,6 @@ async def open_trade(symbol, signal, equity):
     if not order:
         return
 
-    # Feature #5: slippage tracking
     fill_price = float(order.get("average", price) or price)
     slippage = abs(fill_price - price) / price
     slippage_log.append({"symbol": symbol, "expected": price, "actual": fill_price,
@@ -1136,15 +1872,26 @@ async def open_trade(symbol, signal, equity):
                                    sl_price, sl_dist, slippage)
 
     mult = 1 if side == "buy" else -1
+    tp1_price = fill_price + sl_dist * CFG["tp1_r"] * mult
+    tp2_price = signal["tp"]
+    notional = fill_price * contracts
+    rr = abs(tp2_price - fill_price) / sl_dist if sl_dist > 0 else 0
+
     active_trades[symbol] = {
         "id": trade_id, "side": side, "entry": fill_price,
         "weighted_entry": fill_price, "size": contracts,
         "sl": sl_price, "sl_dist_original": sl_dist,
-        "tp1": fill_price + sl_dist * CFG["tp1_r"] * mult,
-        "tp2": signal["tp"], "trail_active": False, "trail_price": None,
+        "tp1": tp1_price, "tp2": tp2_price,
+        "trail_active": False, "trail_price": None,
         "strategy": strategy, "confidence": confidence, "atr": atr,
         "leverage": leverage, "opened_at": time.time(),
-        "tp1_hit": False, "pyramided": False,
+        "tp1_hit": False, "pyramided": False, "notional": notional,
+        "ml_prob": signal.get("ml_prob", 0.5),
+        "mtf_score": signal.get("mtf_score", 0),
+        "op_score": signal.get("op_score", 0.0),
+        "funding": signal.get("funding", 0.0),
+        "ob_imb": signal.get("ob_imb", 0.0),
+        "meta": signal.get("meta", {}),
     }
 
     if drawdown_recovery_remaining > 0:
@@ -1152,9 +1899,45 @@ async def open_trade(symbol, signal, equity):
 
     log.info("OPEN %s %s @ %s | SL=%s | Lev=%dx | %s",
              side.upper(), symbol, sf(fill_price), sf(sl_price), leverage, strategy)
-    msg = (f"\U0001f680 OPEN {side.upper()} {symbol}\n"
-           f"Preis: {sf(fill_price)}\nSL: {sf(sl_price)}\n"
-           f"Leverage: {leverage}x\nStrategie: {strategy}")
+
+    # ----- Rich Telegram message -----
+    side_emoji = "\U0001f7e2" if side == "buy" else "\U0001f534"
+    arrow = "\u2191" if side == "buy" else "\u2193"
+    sym_sent = symbol_sentiment.get(symbol, 0.0)
+    smart = smart_money_bias(symbol)
+    long_liq, short_liq = liq_cluster_for(symbol)
+    oi_chg = oi_change(symbol)
+    news_count = len(news_for_symbol(symbol))
+    sess = get_session()
+
+    msg = (
+        f"{side_emoji} <b>OPEN {side.upper()}</b> {arrow} <code>{symbol}</code>\n"
+        f"\u2503 Strategie: <b>{strategy}</b>\n"
+        f"\u2503 Konfidenz: <b>{confidence*100:.1f}%</b> | ML: {signal.get('ml_prob',0)*100:.0f}%\n"
+        f"\u2503 MTF-Score: {signal.get('mtf_score',0)} | Op-Score: {signal.get('op_score',0):.2f}\n"
+        f"\n<b>Order</b>\n"
+        f"\u2503 Entry: <code>{sf(fill_price)}</code>\n"
+        f"\u2503 SL: <code>{sf(sl_price)}</code>  (\u0394 {sl_dist/price*100:.2f}%)\n"
+        f"\u2503 TP1: <code>{sf(tp1_price)}</code>  ({CFG['tp1_pct']*100:.0f}% out @ {CFG['tp1_r']}R)\n"
+        f"\u2503 TP2: <code>{sf(tp2_price)}</code>  ({CFG['tp2_r']}R)\n"
+        f"\u2503 Risk:Reward: <b>1:{rr:.2f}</b>\n"
+        f"\u2503 Leverage: <b>{leverage}x</b>\n"
+        f"\u2503 Size: {contracts:.4f} ({notional:.0f} USDT)\n"
+        f"\u2503 Risk: {risk_amount:.2f} USDT ({risk_amount/equity*100:.1f}%)\n"
+        f"\u2503 Slippage: {slippage*100:.3f}%\n"
+        f"\n<b>Marktkontext</b>\n"
+        f"\u2503 Funding: {signal.get('funding',0)*100:.4f}%\n"
+        f"\u2503 OB-Imbalance: {signal.get('ob_imb',0):+.2f}\n"
+        f"\u2503 OI 1h: {oi_chg*100:+.2f}%\n"
+        f"\u2503 Smart-Money: {smart:+.2f}\n"
+        f"\u2503 Liqs 3min: long {long_liq/1000:.0f}k$ / short {short_liq/1000:.0f}k$\n"
+        f"\u2503 Sentiment: Symbol {sym_sent:+.2f} | Markt {sentiment_score:+.2f}\n"
+        f"\u2503 News: {news_count} relevant in 60min\n"
+        f"\u2503 Session: {sess} | ATR: {atr/price*100:.2f}%\n"
+        f"\n<b>Konto</b>\n"
+        f"\u2503 Equity: {equity:.2f} USDT | DD: {current_drawdown*100:.1f}%\n"
+        f"\u2503 Offen: {len(active_trades)+1}/{CFG['max_concurrent']} | Heute: {daily_pnl:+.2f}"
+    )
     await tg_send(msg)
 
 
@@ -1271,6 +2054,7 @@ async def close_position(symbol, trade, price, reason):
     entry = trade["weighted_entry"]
     size = trade["size"]
     sl_dist = trade["sl_dist_original"]
+    strategy = trade.get("strategy", "?")
 
     close_side = "sell" if side == "buy" else "buy"
     remaining = size * (1 - CFG["tp1_pct"]) if trade.get("tp1_hit") else size
@@ -1292,17 +2076,64 @@ async def close_position(symbol, trade, price, reason):
         consec_losses += 1
         consec_wins = 0
 
+    # Per-strategy stats
+    s = strategy_stats.setdefault(strategy, {"wins": 0, "losses": 0, "pnl": 0.0,
+                                              "best_r": 0.0, "worst_r": 0.0})
+    s["pnl"] += pnl
+    if pnl > 0:
+        s["wins"] = s.get("wins", 0) + 1
+    else:
+        s["losses"] = s.get("losses", 0) + 1
+    if r_mult > s.get("best_r", 0):
+        s["best_r"] = r_mult
+    if r_mult < s.get("worst_r", 0):
+        s["worst_r"] = r_mult
+
     if current_drawdown >= CFG["drawdown_recovery_threshold"]:
         drawdown_recovery_remaining = CFG["drawdown_recovery_trades"]
 
     await db_close_trade(trade["id"], price, pnl, r_mult)
     await db_save_daily()
 
-    emoji = "\U0001f4b0" if pnl > 0 else "\U0001f534"
-    log.info("CLOSE %s | %s | PnL=%.2f | R=%.2f", symbol, reason, pnl, r_mult)
+    # Slippage on exit
+    slippage_log.append({"symbol": symbol, "expected": price, "actual": price,
+                         "slippage": 0.0, "time": time.time()})
+
+    pnl_pct = pnl / (entry * size) * 100 if entry * size > 0 else 0
     dur = (time.time() - trade["opened_at"]) / 60
-    msg = (f"{emoji} CLOSE {symbol}\nGrund: {reason}\n"
-           f"PnL: {pnl:.2f} USDT\nR: {r_mult:.2f}\nDauer: {dur:.0f} min")
+    emoji = "\U0001f7e2" if pnl > 0 else "\U0001f534"
+    eq = await fetch_balance()
+    daily_eq = (daily_pnl / eq * 100) if eq > 0 else 0
+
+    win_total = s.get("wins", 0)
+    loss_total = s.get("losses", 0)
+    strat_wr = win_total / max(1, win_total + loss_total) * 100
+    check, cross = "\u2705", "\u274c"
+    f_pyr = check if trade.get("pyramided") else cross
+    f_tp1 = check if trade.get("tp1_hit") else cross
+    f_trail = check if trade.get("trail_active") else cross
+
+    msg = (
+        f"{emoji} <b>CLOSE</b> <code>{symbol}</code> ({side.upper()})\n"
+        f"\u2503 Grund: <b>{reason}</b>\n"
+        f"\u2503 Strategie: {strategy}\n"
+        f"\n<b>Ergebnis</b>\n"
+        f"\u2503 PnL: <b>{pnl:+.2f} USDT</b> ({pnl_pct:+.2f}%)\n"
+        f"\u2503 R-Multiple: <b>{r_mult:+.2f}R</b>\n"
+        f"\u2503 Entry: {sf(entry)} \u2192 Exit: {sf(price)}\n"
+        f"\u2503 Hebel: {trade.get('leverage','?')}x | Dauer: {dur:.0f} min\n"
+        f"\u2503 Pyramide: {f_pyr} | TP1: {f_tp1} | Trail: {f_trail}\n"
+        f"\n<b>Strategie-Bilanz ({strategy})</b>\n"
+        f"\u2503 W/L: {win_total}/{loss_total}  WR: {strat_wr:.0f}%\n"
+        f"\u2503 PnL gesamt: {s['pnl']:+.2f} USDT\n"
+        f"\u2503 Best/Worst R: {s.get('best_r',0):.2f} / {s.get('worst_r',0):.2f}\n"
+        f"\n<b>Konto</b>\n"
+        f"\u2503 Equity: {eq:.2f} USDT\n"
+        f"\u2503 Heute: {daily_pnl:+.2f} USDT ({daily_eq:+.2f}%)\n"
+        f"\u2503 Streak: W{consec_wins} / L{consec_losses}\n"
+        f"\u2503 DD: {current_drawdown*100:.1f}% | Offen: {len(active_trades)-1}"
+    )
+    log.info("CLOSE %s | %s | PnL=%.2f | R=%.2f", symbol, reason, pnl, r_mult)
     await tg_send(msg)
 
 
@@ -1393,7 +2224,7 @@ async def check_risk() -> bool:
 
 
 async def scan_signals():
-    """Scan all symbols for trading signals."""
+    """Scan all symbols for trading signals - ranked by opportunity score."""
     if not await check_risk():
         return
 
@@ -1401,20 +2232,29 @@ async def scan_signals():
     if equity <= 0:
         return
 
+    # 1) Pre-fetch candles for ranking
+    candidates: List[Tuple[str, List, float]] = []
     for symbol in CFG["symbols"]:
         if symbol in active_trades:
             continue
+        if symbol in symbol_blacklist:
+            continue
         if is_correlated_blocked(symbol):
             continue
-
         candles = await fetch_ohlcv(symbol, "5m", 200)
         if not candles or len(candles) < 50:
             continue
+        score = opportunity_score(symbol, candles)
+        candidates.append((symbol, candles, score))
 
-        # Feature #1: MTF confluence
+    # 2) Rank by opportunity score, take top N
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    candidates = candidates[: CFG["rank_top_n"]]
+
+    # 3) Eval strategies on ranked candidates
+    for symbol, candles, op_score in candidates:
+        # MTF Confluence (skip for news/liq strategies which have own logic)
         mtf_sc, mtf_dir = await mtf_score(symbol)
-        if mtf_sc < CFG["mtf_min_score"]:
-            continue
 
         # Run strategies
         best_signal = None
@@ -1422,15 +2262,22 @@ async def scan_signals():
         for strat_fn in ALL_STRATEGIES:
             try:
                 sig = await strat_fn(symbol, candles)
-                if sig and sig["confidence"] > best_conf:
-                    if mtf_dir == "none":
+                if not sig:
+                    continue
+                # MTF confluence required for "regular" strategies
+                if strat_fn.__name__ in ("strategy_trend", "strategy_momentum",
+                                         "strategy_breakout", "strategy_scalp",
+                                         "strategy_reversal"):
+                    if mtf_sc < CFG["mtf_min_score"] or mtf_dir == "none":
                         continue
-                    if ((mtf_dir == "long" and sig["side"] == "buy") or
+                    if not ((mtf_dir == "long" and sig["side"] == "buy") or
                             (mtf_dir == "short" and sig["side"] == "sell")):
-                        best_signal = sig
-                        best_conf = sig["confidence"]
+                        continue
+                if sig["confidence"] > best_conf:
+                    best_signal = sig
+                    best_conf = sig["confidence"]
             except Exception as e:
-                log.error("Strategy %s error on %s: %s", strat_fn.__name__, symbol, e)
+                log.error("Strategy %s on %s: %s", strat_fn.__name__, symbol, e)
 
         if not best_signal:
             continue
@@ -1440,22 +2287,39 @@ async def scan_signals():
         ml_prob, ml_conf = ml_predict(features)
         if ml_conf < CFG["ml_confidence_threshold"]:
             continue
+        best_signal["ml_prob"] = ml_prob
+        best_signal["ml_conf"] = ml_conf
+        best_signal["mtf_score"] = mtf_sc
+        best_signal["op_score"] = op_score
         best_signal["confidence"] = (best_signal["confidence"] + ml_conf) / 2
 
-        # Feature #3: funding rate
+        # Funding rate filter
         funding = await fetch_funding_rate(symbol)
+        best_signal["funding"] = funding
         if best_signal["side"] == "buy" and funding > CFG["funding_threshold"]:
             continue
         if best_signal["side"] == "sell" and funding < -CFG["funding_threshold"]:
             continue
 
-        # Feature #11: volume profile boost
+        # Volume profile boost
         vp = calc_volume_profile(candles)
         price = candles[-1][4]
         if vp["poc"] > 0 and abs(price - vp["poc"]) / price < 0.01:
             best_signal["confidence"] *= 1.1
 
-        # Feature #13: cooldown
+        # Order Book Imbalance confirmation (extra confidence)
+        ob_imb = await order_book_imbalance(symbol)
+        best_signal["ob_imb"] = ob_imb
+        if best_signal["side"] == "buy" and ob_imb > 0.15:
+            best_signal["confidence"] *= 1.08
+        elif best_signal["side"] == "sell" and ob_imb < -0.15:
+            best_signal["confidence"] *= 1.08
+        elif best_signal["side"] == "buy" and ob_imb < -0.25:
+            continue  # heavy sell wall
+        elif best_signal["side"] == "sell" and ob_imb > 0.25:
+            continue  # heavy buy wall
+
+        # Cooldown after recent close
         last_close = 0
         for s in slippage_log:
             if s.get("symbol") == symbol:
@@ -1464,7 +2328,7 @@ async def scan_signals():
             continue
 
         await open_trade(symbol, best_signal, equity)
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
 
 
 # ===========================================================================
@@ -1526,6 +2390,106 @@ async def grid_check():
                             level["status"] = "placed"
             except Exception:
                 pass
+
+
+# ===========================================================================
+# AUTO-ALERTS (NEW)
+# ===========================================================================
+
+
+async def alert_big_liquidations():
+    """Push Telegram alert when liquidations cluster crosses threshold."""
+    global last_liq_alert_ts
+    now = time.time()
+    if now - last_liq_alert_ts < 120:  # max one alert / 2 min
+        return
+    threshold = CFG["liq_alert_usd"]
+    agg = total_liq_window(120)  # last 2 min
+    big = [(s, v) for s, v in agg.items() if v >= threshold]
+    if not big:
+        return
+    big.sort(key=lambda x: x[1], reverse=True)
+    last_liq_alert_ts = now
+    text = "\U0001f6a8 <b>Massive Liquidationen (2min)</b>\n\n"
+    for sym, val in big[:6]:
+        long_v, short_v = liq_cluster_for(sym, 120)
+        dom = "LONG" if long_v > short_v else "SHORT"
+        text += f"<b>{sym.split('/')[0]}</b>: {val/1_000_000:.2f}M$ ({dom} dominant)\n"
+    text += "\nMoegliche Konter-Setups durch liquidation_hunt-Strategie."
+    await tg_send(text)
+
+
+async def alert_important_news():
+    """Push Telegram alert for very strong news items."""
+    global last_news_alert_id
+    if not news_cache:
+        return
+    # find strongest |score| not yet alerted, recent (<10min)
+    cutoff = time.time() - 600
+    candidates = [n for n in news_cache if n["ts"] >= cutoff and abs(n["score"]) >= 3]
+    if not candidates:
+        return
+    candidates.sort(key=lambda n: abs(n["score"]), reverse=True)
+    top = candidates[0]
+    nid = str(top.get("id", ""))
+    if nid == last_news_alert_id:
+        return
+    last_news_alert_id = nid
+    score = top["score"]
+    arrow = "\U0001f7e2 BULLISH" if score > 0 else "\U0001f534 BEARISH"
+    cur = "/".join(top.get("currencies", [])[:3]) or "Markt"
+    text = (
+        f"\U0001f4f0 <b>News-Alert</b> {arrow}\n\n"
+        f"<b>{cur}</b> ({top['source']})\n"
+        f"Score: {score:+d}\n\n"
+        f"{top['title'][:300]}\n"
+    )
+    if top.get("url"):
+        text += f"\n{top['url']}"
+    await tg_send(text)
+
+
+async def hourly_summary():
+    """Comprehensive hourly status to Telegram."""
+    global last_hourly_summary
+    if not CFG["tg_hourly_summary"]:
+        return
+    now = time.time()
+    if now - last_hourly_summary < CFG["tg_summary_interval_sec"]:
+        return
+    last_hourly_summary = now
+
+    eq = await fetch_balance()
+    fg = await fetch_fear_greed()
+    margin = await get_margin_ratio()
+    positions = await fetch_positions_once()
+    heat = portfolio_heat(positions)
+    uptime = (now - sprint_start) / 3600
+
+    # Top 3 strategies by pnl
+    top_strats = sorted(strategy_stats.items(), key=lambda x: x[1].get("pnl", 0), reverse=True)[:3]
+    strat_str = " | ".join(f"{n}:{s['pnl']:+.1f}" for n, s in top_strats) or "noch keine"
+
+    # Recent liquidation total (5 min)
+    liq_total = sum(total_liq_window(300).values())
+
+    text = (
+        f"\u23f0 <b>Stuendliche Zusammenfassung</b>\n\n"
+        f"<b>Konto</b>\n"
+        f"Equity: {eq:.2f} USDT | Peak: {peak_equity:.2f}\n"
+        f"DD: {current_drawdown*100:.2f}% | Heute: {daily_pnl:+.2f}\n"
+        f"Heat: {heat*100:.1f}% | Margin: {margin*100:.1f}%\n"
+        f"\n<b>Trading</b>\n"
+        f"Offen: {len(active_trades)}/{CFG['max_concurrent']}\n"
+        f"Streak: W{consec_wins} / L{consec_losses}\n"
+        f"Top Strats: {strat_str}\n"
+        f"\n<b>Markt</b>\n"
+        f"Sentiment: {sentiment_score:+.2f} ({len(news_cache)} News)\n"
+        f"Fear &amp; Greed: {fg}/100\n"
+        f"Liqs 5min: {liq_total/1_000_000:.2f}M$\n"
+        f"Session: {get_session()} | Uptime: {uptime:.1f}h"
+    )
+    await tg_send(text)
 
 
 # ===========================================================================
@@ -1644,11 +2608,29 @@ async def setup_telegram():
 
     async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
-            "\U0001f3db OLYMPUS Trading Bot aktiv!\n"
-            "/status - Bot Status\n/report - Bericht\n"
-            "/trades - Offene Trades\n/pause - Pausieren\n"
-            "/resume - Fortsetzen\n/close_all - Alle schliessen\n"
-            "/ask <frage> - KI fragen"
+            "\U0001f3db <b>OLYMPUS Trading Bot</b>\n\n"
+            "<b>Status &amp; Info</b>\n"
+            "/status - Bot Status\n"
+            "/report - Voller Bericht\n"
+            "/trades - Offene Trades (detail)\n"
+            "/log [n] - Letzte n Closes\n"
+            "/perf - Strategie-Performance\n"
+            "/risk - Risiko-Dashboard\n"
+            "<b>Markt</b>\n"
+            "/news [sym] - Aktuelle News\n"
+            "/liq [sym] - Liquidationen\n"
+            "/top [n] - Top Opportunities\n"
+            "/sentiment - Markt-Sentiment\n"
+            "/oi sym - Open Interest\n"
+            "<b>Steuerung</b>\n"
+            "/pause - Pausieren\n"
+            "/resume - Fortsetzen\n"
+            "/close_all - Alle schliessen\n"
+            "/setrisk &lt;pct&gt; - Risk pro Trade\n"
+            "/blacklist sym - Symbol blocken\n"
+            "/whitelist sym - Symbol freigeben\n"
+            "/ask &lt;frage&gt; - KI fragen",
+            parse_mode="HTML",
         )
 
     async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1668,10 +2650,255 @@ async def setup_telegram():
         if not active_trades:
             await update.message.reply_text("Keine offenen Trades.")
             return
-        text = "\U0001f4c8 <b>Offene Trades:</b>\n\n"
+        text = f"\U0001f4c8 <b>Offene Trades ({len(active_trades)})</b>\n\n"
         for sym, t in active_trades.items():
-            text += f"{sym} {t['side'].upper()}\nEntry: {sf(t['entry'])}\nSL: {sf(t['sl'])}\n\n"
+            ticker = await fetch_ticker(sym)
+            cur = float(ticker.get("last", 0) or t["entry"])
+            entry = t["weighted_entry"]
+            sl_dist = t.get("sl_dist_original", 0)
+            mult = 1 if t["side"] == "buy" else -1
+            cur_r = ((cur - entry) / sl_dist * mult) if sl_dist > 0 else 0
+            unr_pnl = (cur - entry) * t["size"] * mult
+            dur = (time.time() - t["opened_at"]) / 60
+            arrow = "\u2191" if t["side"] == "buy" else "\u2193"
+            text += (
+                f"<b>{sym}</b> {arrow} {t['side'].upper()} ({t.get('strategy','?')})\n"
+                f"  Entry {sf(entry)} | Now {sf(cur)} | <b>{cur_r:+.2f}R</b>\n"
+                f"  PnL: {unr_pnl:+.2f}$ | Lev {t.get('leverage','?')}x | {dur:.0f}min\n"
+                f"  SL {sf(t['sl'])} | TP1 {sf(t.get('tp1',0))} | TP2 {sf(t.get('tp2',0))}\n\n"
+            )
         await update.message.reply_text(text, parse_mode="HTML")
+
+    async def cmd_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        n = 10
+        if context.args:
+            try:
+                n = max(1, min(50, int(context.args[0])))
+            except Exception:
+                pass
+        if not db:
+            await update.message.reply_text("DB nicht verfuegbar.")
+            return
+        async with db.execute(
+            "SELECT symbol,side,strategy,pnl,r_multiple,opened_at,closed_at "
+            "FROM trades WHERE status='closed' ORDER BY id DESC LIMIT ?",
+            (n,),
+        ) as cur:
+            rows = await cur.fetchall()
+        if not rows:
+            await update.message.reply_text("Keine geschlossenen Trades.")
+            return
+        text = f"\U0001f4dc <b>Letzte {len(rows)} Trades</b>\n\n"
+        for r in rows:
+            pnl = float(r["pnl"] or 0)
+            rm = float(r["r_multiple"] or 0)
+            emo = "\u2705" if pnl > 0 else "\u274c"
+            text += f"{emo} {r['symbol']} {r['side'][:1].upper()} {r['strategy']}: {pnl:+.2f}$ ({rm:+.2f}R)\n"
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    async def cmd_perf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not strategy_stats:
+            await update.message.reply_text("Noch keine Strategie-Stats.")
+            return
+        text = "\U0001f4ca <b>Strategie-Performance</b>\n\n"
+        rows = sorted(strategy_stats.items(), key=lambda x: x[1].get("pnl", 0), reverse=True)
+        for name, s in rows:
+            w, l = s.get("wins", 0), s.get("losses", 0)
+            wr = w / max(1, w + l) * 100
+            text += (f"<b>{name}</b>\n"
+                     f"  W/L: {w}/{l}  WR: {wr:.0f}%\n"
+                     f"  PnL: {s.get('pnl',0):+.2f}$  Best/Worst R: {s.get('best_r',0):.2f}/{s.get('worst_r',0):.2f}\n\n")
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    async def cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        eq = await fetch_balance()
+        margin = await get_margin_ratio()
+        positions = await fetch_positions_once()
+        heat = portfolio_heat(positions)
+        cur_risk = risk_override if risk_override is not None else CFG["risk_per_trade"]
+        text = (
+            f"\u26a0\ufe0f <b>Risiko-Dashboard</b>\n\n"
+            f"Equity: {eq:.2f} USDT\n"
+            f"Peak: {peak_equity:.2f} | DD: {current_drawdown*100:.2f}%\n"
+            f"Tages-PnL: {daily_pnl:+.2f} USDT\n"
+            f"\n<b>Limits</b>\n"
+            f"Risk pro Trade: {cur_risk*100:.1f}% (Max: {CFG['max_risk_per_trade']*100:.1f}%)\n"
+            f"Max DD: {CFG['max_drawdown']*100:.0f}% | Tageslimit: {CFG['daily_loss_limit']*100:.0f}%\n"
+            f"\n<b>Aktuell</b>\n"
+            f"Portfolio Heat: {heat*100:.1f}% / {CFG['portfolio_heat_max']*100:.0f}%\n"
+            f"Margin frei: {margin*100:.1f}%\n"
+            f"Offen: {len(active_trades)}/{CFG['max_concurrent']}\n"
+            f"Streak: W{consec_wins} / L{consec_losses}\n"
+            f"Recovery-Modus: {'ja, ' + str(drawdown_recovery_remaining) + ' Trades' if drawdown_recovery_remaining > 0 else 'nein'}\n"
+            f"Cooldown: {cooldown_seconds()}s"
+        )
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    async def cmd_news(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await fetch_news()
+        sym_filter = None
+        if context.args:
+            sym_filter = context.args[0].upper()
+        items = news_cache[:15]
+        if sym_filter:
+            items = [n for n in news_cache if sym_filter in [c.upper() for c in n.get("currencies", [])]][:10]
+        if not items:
+            await update.message.reply_text("Keine News verfuegbar.")
+            return
+        text = "\U0001f4f0 <b>News</b>\n\n"
+        for n in items:
+            score = n["score"]
+            arrow = "\U0001f7e2" if score > 0 else ("\U0001f534" if score < 0 else "\u26aa\ufe0f")
+            cur_str = "/".join(n.get("currencies", [])[:3])
+            text += f"{arrow} <b>{cur_str}</b> ({n['source']})\n  {n['title'][:100]}\n\n"
+        await update.message.reply_text(text[:4000], parse_mode="HTML")
+
+    async def cmd_liq(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        sym_filter = context.args[0].upper() if context.args else None
+        liqs = list(liquidations_log)[-30:]
+        if sym_filter:
+            liqs = [l for l in liqs if sym_filter in l["symbol"]]
+        if not liqs:
+            await update.message.reply_text("Keine Liquidationen im Buffer.")
+            return
+        liqs = sorted(liqs, key=lambda x: x["value_usd"], reverse=True)[:15]
+        text = "\U0001f6a8 <b>Top Liquidationen</b>\n\n"
+        for l in liqs:
+            arrow = "\U0001f534" if l["side"] == "long" else "\U0001f7e2"
+            ago = (time.time() - l["ts"]) / 60
+            text += f"{arrow} {l['symbol'].split('/')[0]} {l['side'].upper()}: {l['value_usd']/1000:.0f}k$ ({ago:.0f}m)\n"
+        # Aggregated last 5min
+        agg = total_liq_window(300)
+        if agg:
+            top = sorted(agg.items(), key=lambda x: x[1], reverse=True)[:5]
+            text += "\n<b>5min Aggregate</b>\n"
+            for sym, v in top:
+                text += f"  {sym.split('/')[0]}: {v/1000:.0f}k$\n"
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        n = CFG["tg_top_n"]
+        if context.args:
+            try:
+                n = max(3, min(20, int(context.args[0])))
+            except Exception:
+                pass
+        scored: List[Tuple[str, float, float, float]] = []
+        for sym in CFG["symbols"]:
+            try:
+                cs = await fetch_ohlcv(sym, "5m", 100)
+                if not cs or len(cs) < 30:
+                    continue
+                op = opportunity_score(sym, cs)
+                sent = symbol_sentiment.get(sym, 0.0)
+                smart = smart_money_bias(sym)
+                scored.append((sym, op, sent, smart))
+            except Exception:
+                continue
+        scored.sort(key=lambda x: x[1], reverse=True)
+        text = f"\U0001f3af <b>Top {n} Opportunities</b>\n\n"
+        for sym, op, sent, smart in scored[:n]:
+            text += f"<b>{sym.split('/')[0]:<6}</b> Score {op:.2f} | Sent {sent:+.2f} | Smart {smart:+.2f}\n"
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    async def cmd_sentiment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await fetch_news()
+        await refresh_sentiment()
+        fg = await fetch_fear_greed()
+        text = (
+            f"\U0001f9e0 <b>Markt-Sentiment</b>\n\n"
+            f"Markt-Score: <b>{sentiment_score:+.2f}</b> ({len(news_cache)} News)\n"
+            f"Fear &amp; Greed: <b>{fg}/100</b>\n\n"
+            f"<b>Top bullish</b>\n"
+        )
+        srt = sorted(symbol_sentiment.items(), key=lambda x: x[1], reverse=True)
+        for sym, v in srt[:5]:
+            if v > 0:
+                text += f"  \U0001f7e2 {sym.split('/')[0]}: {v:+.2f}\n"
+        text += "\n<b>Top bearish</b>\n"
+        for sym, v in srt[-5:]:
+            if v < 0:
+                text += f"  \U0001f534 {sym.split('/')[0]}: {v:+.2f}\n"
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    async def cmd_oi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text("Nutzung: /oi BTC")
+            return
+        target = context.args[0].upper()
+        match = None
+        for sym in CFG["symbols"]:
+            if _base_of(sym) == target:
+                match = sym
+                break
+        if not match:
+            await update.message.reply_text(f"Symbol {target} nicht in Universum.")
+            return
+        chg = oi_change(match) * 100
+        hist = oi_history.get(match)
+        latest = hist[-1][1] if hist else 0
+        smart = smart_money_bias(match)
+        top = ls_ratio.get(match + "_top", 0)
+        tak = ls_ratio.get(match + "_taker", 0)
+        text = (
+            f"\U0001f4c8 <b>{target} Markt-Daten</b>\n\n"
+            f"Open Interest: {latest:,.0f}\n"
+            f"OI 1h Change: {chg:+.2f}%\n"
+            f"Top-Trader L/S: {top:.2f}\n"
+            f"Taker B/S 5m: {tak:.2f}\n"
+            f"Smart-Money Bias: {smart:+.2f}\n"
+        )
+        long_liq, short_liq = liq_cluster_for(match)
+        text += f"Liqs 3min: long {long_liq/1000:.0f}k$ / short {short_liq/1000:.0f}k$\n"
+        text += f"Sentiment: {symbol_sentiment.get(match, 0):+.2f}\n"
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    async def cmd_setrisk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        global risk_override
+        if not context.args:
+            cur = risk_override if risk_override is not None else CFG["risk_per_trade"]
+            await update.message.reply_text(
+                f"Aktuelles Risk: {cur*100:.1f}%. Nutzung: /setrisk 5  (= 5%)"
+            )
+            return
+        try:
+            pct = float(context.args[0])
+            if pct < 0.5 or pct > CFG["max_risk_per_trade"] * 100:
+                await update.message.reply_text(
+                    f"Risk muss zwischen 0.5% und {CFG['max_risk_per_trade']*100:.0f}% liegen."
+                )
+                return
+            risk_override = pct / 100
+            await update.message.reply_text(f"\u2705 Risk auf {pct:.1f}% gesetzt.")
+        except Exception:
+            await update.message.reply_text("Ungueltige Eingabe.")
+
+    async def cmd_blacklist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text(f"Blacklist: {', '.join(symbol_blacklist) or 'leer'}")
+            return
+        target = context.args[0].upper()
+        for sym in CFG["symbols"]:
+            if _base_of(sym) == target:
+                symbol_blacklist.add(sym)
+                await update.message.reply_text(f"\U0001f6ab {sym} blockiert.")
+                return
+        await update.message.reply_text("Symbol nicht gefunden.")
+
+    async def cmd_whitelist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            symbol_blacklist.clear()
+            await update.message.reply_text("\u2705 Blacklist geleert.")
+            return
+        target = context.args[0].upper()
+        before = len(symbol_blacklist)
+        for sym in list(symbol_blacklist):
+            if _base_of(sym) == target:
+                symbol_blacklist.discard(sym)
+        if len(symbol_blacklist) < before:
+            await update.message.reply_text(f"\u2705 {target} freigegeben.")
+        else:
+            await update.message.reply_text("Nicht in Blacklist.")
 
     async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
         global bot_paused
@@ -1705,6 +2932,17 @@ async def setup_telegram():
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("close_all", cmd_close_all))
     app.add_handler(CommandHandler("ask", cmd_ask))
+    app.add_handler(CommandHandler("log", cmd_log))
+    app.add_handler(CommandHandler("perf", cmd_perf))
+    app.add_handler(CommandHandler("risk", cmd_risk))
+    app.add_handler(CommandHandler("news", cmd_news))
+    app.add_handler(CommandHandler("liq", cmd_liq))
+    app.add_handler(CommandHandler("top", cmd_top))
+    app.add_handler(CommandHandler("sentiment", cmd_sentiment))
+    app.add_handler(CommandHandler("oi", cmd_oi))
+    app.add_handler(CommandHandler("setrisk", cmd_setrisk))
+    app.add_handler(CommandHandler("blacklist", cmd_blacklist))
+    app.add_handler(CommandHandler("whitelist", cmd_whitelist))
 
     # Bug #2, #3: proper async job functions (not lambdas)
     async def job_refresh(context: ContextTypes.DEFAULT_TYPE):
@@ -1939,6 +3177,16 @@ async def main_loop():
     await warmup_ml()
     await update_correlations()
 
+    # Initial fetch of news / OI / LSR / sentiment so bot has data immediately
+    await fetch_news()
+    await refresh_sentiment()
+    await fetch_oi_history_binance()
+    await fetch_long_short_ratio()
+    await fetch_top_trader_ratio()
+    await fetch_taker_ratio()
+    # Start liquidation websocket (background, runs forever)
+    await fetch_liquidations()
+
     dash_runner = await start_dashboard()
     wh_runner = await start_webhook()
     tg_app = await setup_telegram()
@@ -1950,16 +3198,27 @@ async def main_loop():
     if equity > 0 and peak_equity == 0:
         peak_equity = equity
 
-    msg = (f"\U0001f3db OLYMPUS gestartet!\n"
-           f"Equity: {sf(equity, '.2f')} USDT\n"
-           f"Sprint: {CFG['sprint_hours']}h\n"
-           f"Symbole: {len(CFG['symbols'])}\n"
-           f"Max Positionen: {CFG['max_concurrent']}")
+    fg_init = await fetch_fear_greed()
+    msg = (
+        f"\U0001f3db <b>OLYMPUS gestartet</b>\n\n"
+        f"Equity: {sf(equity, '.2f')} USDT\n"
+        f"Sprint: {CFG['sprint_hours']}h\n"
+        f"Symbole: {len(CFG['symbols'])} | Max Positionen: {CFG['max_concurrent']}\n"
+        f"Strategien: {len(ALL_STRATEGIES)}\n"
+        f"Risk/Trade: {CFG['risk_per_trade']*100:.1f}% (Max {CFG['max_risk_per_trade']*100:.0f}%)\n"
+        f"Leverage: {CFG['leverage_min']}-{CFG['leverage_max']}x\n"
+        f"Fear &amp; Greed: {fg_init}/100 | News: {len(news_cache)}"
+    )
     await tg_send(msg)
 
     cycle_count = 0
     health_iv = max(1, int(CFG["health_ping_sec"] / CFG["cycle_sec"]))
     equity_iv = max(1, int(3600 / CFG["cycle_sec"]))
+    news_iv = max(1, int(CFG["news_check_sec"] / CFG["cycle_sec"]))
+    oi_iv = max(1, int(CFG["oi_check_sec"] / CFG["cycle_sec"]))
+    lsr_iv = max(1, int(CFG["lsr_check_sec"] / CFG["cycle_sec"]))
+    summary_iv = max(1, int(CFG["tg_summary_interval_sec"] / CFG["cycle_sec"]))
+    alert_iv = max(1, int(60 / CFG["cycle_sec"]))  # alerts every ~minute
 
     try:
         while not shutdown_event.is_set():
@@ -1982,6 +3241,27 @@ async def main_loop():
                 if cycle_count % equity_iv == 0:
                     await equity_snapshot()
                     await db_save_state("peak_equity", peak_equity)
+
+                # Periodic data refresh
+                if cycle_count % news_iv == 0:
+                    await fetch_news()
+                    await refresh_sentiment()
+
+                if cycle_count % oi_iv == 0:
+                    await fetch_oi_history_binance()
+
+                if cycle_count % lsr_iv == 0:
+                    await fetch_long_short_ratio()
+                    await fetch_top_trader_ratio()
+                    await fetch_taker_ratio()
+
+                # Auto-alerts
+                if cycle_count % alert_iv == 0:
+                    await alert_big_liquidations()
+                    await alert_important_news()
+
+                if cycle_count % summary_iv == 0:
+                    await hourly_summary()
 
                 if active_trades:
                     await manage_positions()
