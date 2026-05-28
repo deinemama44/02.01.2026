@@ -7,19 +7,19 @@ All 22 bug fixes applied, all 15 new features implemented.
 
 import os
 import sys
+import html
 import json
 import time
 import signal
-import hashlib
 import hmac
 import logging
 import asyncio
 import statistics
 import math
 import pickle
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional, Dict, List, Any, Tuple
+from typing import Dict, List, Any, Tuple
 from logging.handlers import RotatingFileHandler
 from collections import deque
 from functools import wraps
@@ -78,7 +78,7 @@ CFG = {
         "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
         "XRP/USDT:USDT", "DOGE/USDT:USDT", "ARB/USDT:USDT",
         "AVAX/USDT:USDT", "LINK/USDT:USDT", "OP/USDT:USDT",
-        "MATIC/USDT:USDT", "ADA/USDT:USDT", "DOT/USDT:USDT",
+        "POL/USDT:USDT", "ADA/USDT:USDT", "DOT/USDT:USDT",
         "NEAR/USDT:USDT", "APT/USDT:USDT", "SUI/USDT:USDT",
         "WIF/USDT:USDT", "PEPE/USDT:USDT", "FET/USDT:USDT",
     ],
@@ -165,12 +165,17 @@ position_cache_time = 0.0
 correlation_matrix: Dict[str, Dict[str, float]] = {}
 ml_model = None
 ml_win_rate = 0.5
-equity_history: List[Tuple[float, float]] = []
-slippage_log: List[Dict] = []
+# Bounded history queues (prevent unbounded memory growth)
+equity_history: "deque[Tuple[float, float]]" = deque(maxlen=20000)
+slippage_log: "deque[Dict]" = deque(maxlen=2000)
 active_trades: Dict[str, Dict] = {}
 grid_levels: Dict[str, List[Dict]] = {}
 shutdown_event = None
 last_health_ping = 0.0
+last_closed_at: Dict[str, float] = {}
+# Cache for db_win_rate to avoid DB query per scan-cycle
+_win_rate_cache: Dict[str, float] = {"value": 0.5, "ts": 0.0}
+_WIN_RATE_TTL = 300  # seconds
 
 
 # ===========================================================================
@@ -189,8 +194,12 @@ def sf(value, fmt=".4f", default="N/A"):
         return default
 
 
-def retry(max_attempts=3, delay=1.0, exceptions=(IOError, OSError, ConnectionError)):
-    """Retry decorator - only catches specific exceptions (Bug #20)."""
+# Retryable network/transport errors (do NOT include broad Exception)
+_RETRY_EXCEPTIONS = (IOError, OSError, ConnectionError, asyncio.TimeoutError, TimeoutError)
+
+
+def retry(max_attempts=3, delay=1.0, exceptions=_RETRY_EXCEPTIONS):
+    """Retry decorator - only catches specific transient exceptions (Bug #20)."""
     def decorator(func):
         @wraps(func)
         async def wrapper(*args, **kwargs):
@@ -399,6 +408,22 @@ async def db_win_rate(lookback=100) -> float:
     return wins / len(rows)
 
 
+async def db_win_rate_cached(lookback=100) -> float:
+    """TTL-cached win-rate to avoid DB query per signal scan."""
+    now = time.time()
+    if now - _win_rate_cache["ts"] < _WIN_RATE_TTL:
+        return _win_rate_cache["value"]
+    wr = await db_win_rate(lookback)
+    _win_rate_cache["value"] = wr
+    _win_rate_cache["ts"] = now
+    return wr
+
+
+def invalidate_win_rate_cache():
+    """Force re-fetch on next access (called after a trade closes)."""
+    _win_rate_cache["ts"] = 0.0
+
+
 # ===========================================================================
 # EXCHANGE LAYER (Bug #10, #11, #12 fixes)
 # ===========================================================================
@@ -437,7 +462,7 @@ async def close_exchange():
             pass
 
 
-@retry(max_attempts=3, delay=2.0, exceptions=(Exception,))
+@retry(max_attempts=3, delay=2.0)
 async def fetch_ohlcv(symbol: str, timeframe: str = "5m", limit: int = 100):
     """Fetch candles with cache (Bug #10, #11: longer TTL, batched)."""
     cache_key = f"{symbol}_{timeframe}"
@@ -450,6 +475,12 @@ async def fetch_ohlcv(symbol: str, timeframe: str = "5m", limit: int = 100):
         return []
     data = await exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
     data_cache[cache_key] = (now, data)
+    # Bound data_cache to prevent unbounded growth
+    if len(data_cache) > 1000:
+        # Drop oldest 200 entries (those whose timestamps are smallest)
+        oldest_keys = sorted(data_cache.keys(), key=lambda k: data_cache[k][0])[:200]
+        for k in oldest_keys:
+            data_cache.pop(k, None)
     return data
 
 
@@ -556,6 +587,21 @@ async def cancel_order(symbol: str, order_id: str) -> bool:
     return False
 
 
+async def _fetch_positions_fresh() -> List[Dict]:
+    """Force-refresh positions, bypassing cache. Used for safety-critical checks."""
+    global position_cache, position_cache_time
+    if not exchange:
+        return []
+    try:
+        positions = await exchange.fetch_positions()
+        position_cache = [p for p in positions if float(p.get("contracts", 0)) > 0]
+        position_cache_time = time.time()
+        return position_cache
+    except Exception as e:
+        log.error("fetch_positions(fresh) error: %s", e)
+        return position_cache
+
+
 async def place_smart(symbol, side, amount, limit_price=None):
     """Bug #21: position check before market fallback to prevent doubles."""
     if limit_price:
@@ -568,15 +614,16 @@ async def place_smart(symbol, side, amount, limit_price=None):
                     return status
                 cancelled = await cancel_order(symbol, order["id"])
                 if not cancelled:
-                    positions = await fetch_positions_once()
+                    # Force-refresh: do NOT trust the cached snapshot here
+                    positions = await _fetch_positions_fresh()
                     for p in positions:
                         if p["symbol"] == symbol and float(p.get("contracts", 0)) > 0:
                             log.warning("Already filled on %s, skip market", symbol)
                             return status
             except Exception:
                 pass
-    # Market fallback with position check (Bug #21)
-    positions = await fetch_positions_once()
+    # Market fallback with FRESH position check (Bug #21 strengthened)
+    positions = await _fetch_positions_fresh()
     for p in positions:
         if p["symbol"] == symbol and float(p.get("contracts", 0)) > 0:
             log.warning("Position exists on %s, skipping market", symbol)
@@ -722,7 +769,7 @@ def detect_rsi_divergence(closes, period=14) -> str:
 # ===========================================================================
 
 
-async def mtf_score(symbol: str) -> Tuple[int, str]:
+async def mtf_score(symbol: str) -> Tuple[float, str]:
     """Score signal confluence across timeframes."""
     bull, bear = 0.0, 0.0
     for tf in CFG["timeframes"]:
@@ -747,10 +794,10 @@ async def mtf_score(symbol: str) -> Tuple[int, str]:
         elif rsi > 65:
             bear += 0.5
     if bull >= CFG["mtf_min_score"] and bull > bear:
-        return int(bull), "long"
+        return bull, "long"
     if bear >= CFG["mtf_min_score"] and bear > bull:
-        return int(bear), "short"
-    return 0, "none"
+        return bear, "short"
+    return 0.0, "none"
 
 
 # ===========================================================================
@@ -764,7 +811,11 @@ async def update_correlations():
         return
     returns_data = {}
     for symbol in CFG["symbols"]:
-        candles = await fetch_ohlcv(symbol, "1h", CFG["correlation_window"] + 1)
+        try:
+            candles = await fetch_ohlcv(symbol, "1h", CFG["correlation_window"] + 1)
+        except Exception as e:
+            log.warning("Correlation skip %s: %s", symbol, e)
+            continue
         if candles and len(candles) > 10:
             closes = [c[4] for c in candles]
             rets = [(closes[i] - closes[i - 1]) / closes[i - 1] for i in range(1, len(closes))]
@@ -865,14 +916,21 @@ async def train_ml():
         return
     X_all, y_all = [], []
     for symbol in CFG["symbols"][:8]:
-        candles = await fetch_ohlcv(symbol, "5m", 500)
+        try:
+            candles = await fetch_ohlcv(symbol, "5m", 500)
+        except Exception as e:
+            log.warning("ML training skip %s: %s", symbol, e)
+            continue
         if not candles or len(candles) < 100:
             continue
         for i in range(50, len(candles) - 10):
             features = build_features(candles[:i])
             if not features or len(features) != 10:
                 continue
-            future_high = max(c[2] for c in candles[i:i + 10])
+            future_window = candles[i + 1:i + 11]
+            if not future_window:
+                continue
+            future_high = max(c[2] for c in future_window)
             current = candles[i][4]
             label = 1 if (future_high - current) / current > 0.003 else 0
             X_all.append(features)
@@ -895,14 +953,26 @@ async def train_ml():
         log.error("ML training failed: %s", e)
 
 
-def ml_predict(features) -> Tuple[float, float]:
+def ml_predict(features, side: str = "buy") -> Tuple[float, float]:
+    """Direction-aware ML prediction.
+
+    Returns (probability_of_signal_being_correct, confidence).
+    For "buy": probability that price goes up (label=1).
+    For "sell": probability that price does NOT go up (label=0).
+    Returns (0.5, 0.0) when no model is loaded so callers can detect "no model".
+    """
     if ml_model is None or not features or len(features) != 10:
-        return 0.5, 0.5
+        return 0.5, 0.0
     try:
         proba = ml_model.predict_proba([features])[0]
-        return float(proba[1]), float(max(proba))
+        # proba[1] = prob price moves up; proba[0] = prob it doesn't
+        if side == "buy":
+            p = float(proba[1])
+        else:
+            p = float(proba[0])
+        return p, p
     except Exception:
-        return 0.5, 0.5
+        return 0.5, 0.0
 
 
 # ===========================================================================
@@ -1042,12 +1112,16 @@ ALL_STRATEGIES = [strategy_trend, strategy_momentum, strategy_breakout, strategy
 
 async def kelly_size(confidence: float, equity: float) -> float:
     """Kelly with actual win rate (Bug #16), session adjust (Feature #2), recovery (Feature #7)."""
-    win_rate = await db_win_rate() if db else ml_win_rate
+    win_rate = await db_win_rate_cached() if db else ml_win_rate
     if win_rate <= 0 or win_rate >= 1:
         win_rate = 0.5
     avg_r = 1.5
     kelly = win_rate - (1 - win_rate) / avg_r
-    kelly = max(0.01, min(kelly, 0.25))
+    if kelly <= 0:
+        log.debug("kelly_size: negative edge (kelly=%.4f), using minimum size", kelly)
+        kelly = 0.01
+    else:
+        kelly = min(kelly, 0.25)
     size_pct = kelly * confidence * CFG["risk_per_trade"] / 0.02
     size_pct *= session_size_mult()
     if drawdown_recovery_remaining > 0:
@@ -1216,6 +1290,9 @@ async def manage_positions():
             close_side = "sell" if side == "buy" else "buy"
             await place_order(symbol, close_side, partial, params={"reduceOnly": True})
             trade["tp1_hit"] = True
+            trade["tp1_price"] = price
+            trade["tp1_filled_size"] = partial
+            trade["size"] -= partial  # Reduce size by partial amount
             trade["sl"] = entry  # Move to breakeven
             log.info("%s: TP1 hit, partial close, SL->BE", symbol)
             await tg_send(f"\u2705 {symbol} TP1 erreicht! SL auf Einstand")
@@ -1273,30 +1350,59 @@ async def close_position(symbol, trade, price, reason):
     sl_dist = trade["sl_dist_original"]
 
     close_side = "sell" if side == "buy" else "buy"
-    remaining = size * (1 - CFG["tp1_pct"]) if trade.get("tp1_hit") else size
-    if remaining > 0:
-        await place_order(symbol, close_side, remaining, params={"reduceOnly": True})
+    if size > 0:
+        await place_order(symbol, close_side, size, params={"reduceOnly": True})
 
+    # Calculate PnL including TP1 partial if it was hit
     if side == "buy":
-        pnl = (price - entry) * size
+        remaining_pnl = (price - entry) * size
+    else:
+        remaining_pnl = (entry - price) * size
+
+    tp1_pnl = 0.0
+    if trade.get("tp1_hit") and trade.get("tp1_price") and trade.get("tp1_filled_size"):
+        tp1_price = trade["tp1_price"]
+        tp1_size = trade["tp1_filled_size"]
+        if side == "buy":
+            tp1_pnl = (tp1_price - entry) * tp1_size
+        else:
+            tp1_pnl = (entry - tp1_price) * tp1_size
+
+    pnl = remaining_pnl + tp1_pnl
+    if side == "buy":
         r_mult = (price - entry) / sl_dist if sl_dist > 0 else 0
     else:
-        pnl = (entry - price) * size
         r_mult = (entry - price) / sl_dist if sl_dist > 0 else 0
 
     daily_pnl += pnl
     if pnl > 0:
         consec_wins += 1
         consec_losses = 0
-    else:
+    elif pnl < 0:
         consec_losses += 1
         consec_wins = 0
+    # pnl == 0 (break-even): don't touch streaks
 
-    if current_drawdown >= CFG["drawdown_recovery_threshold"]:
+    if current_drawdown >= CFG["drawdown_recovery_threshold"] and drawdown_recovery_remaining <= 0:
         drawdown_recovery_remaining = CFG["drawdown_recovery_trades"]
+
+    # Track last close time for cooldown
+    last_closed_at[symbol] = time.time()
+    # Bound last_closed_at size (keep most recent 500)
+    if len(last_closed_at) > 500:
+        oldest = sorted(last_closed_at.items(), key=lambda x: x[1])[:100]
+        for k, _ in oldest:
+            last_closed_at.pop(k, None)
 
     await db_close_trade(trade["id"], price, pnl, r_mult)
     await db_save_daily()
+    # Persist peak_equity on every close so a crash doesn't lose state
+    try:
+        await db_save_state("peak_equity", peak_equity)
+    except Exception as e:
+        log.debug("peak_equity persist failed: %s", e)
+    # Invalidate cached win rate so next signal sees the updated value
+    invalidate_win_rate_cache()
 
     emoji = "\U0001f4b0" if pnl > 0 else "\U0001f534"
     log.info("CLOSE %s | %s | PnL=%.2f | R=%.2f", symbol, reason, pnl, r_mult)
@@ -1407,13 +1513,16 @@ async def scan_signals():
         if is_correlated_blocked(symbol):
             continue
 
-        candles = await fetch_ohlcv(symbol, "5m", 200)
+        try:
+            candles = await fetch_ohlcv(symbol, "5m", 200)
+        except Exception:
+            continue
         if not candles or len(candles) < 50:
             continue
 
         # Feature #1: MTF confluence
         mtf_sc, mtf_dir = await mtf_score(symbol)
-        if mtf_sc < CFG["mtf_min_score"]:
+        if mtf_sc < CFG["mtf_min_score"] or mtf_dir == "none":
             continue
 
         # Run strategies
@@ -1423,8 +1532,6 @@ async def scan_signals():
             try:
                 sig = await strat_fn(symbol, candles)
                 if sig and sig["confidence"] > best_conf:
-                    if mtf_dir == "none":
-                        continue
                     if ((mtf_dir == "long" and sig["side"] == "buy") or
                             (mtf_dir == "short" and sig["side"] == "sell")):
                         best_signal = sig
@@ -1435,12 +1542,14 @@ async def scan_signals():
         if not best_signal:
             continue
 
-        # ML check
+        # ML check (direction-aware)
         features = build_features(candles)
-        ml_prob, ml_conf = ml_predict(features)
-        if ml_conf < CFG["ml_confidence_threshold"]:
+        ml_prob, ml_conf = ml_predict(features, best_signal["side"])
+        # If no model loaded, ml_conf == 0.0 -> skip ML gating; otherwise enforce threshold
+        if ml_conf > 0.0 and ml_conf < CFG["ml_confidence_threshold"]:
             continue
-        best_signal["confidence"] = (best_signal["confidence"] + ml_conf) / 2
+        if ml_conf > 0.0:
+            best_signal["confidence"] = (best_signal["confidence"] + ml_conf) / 2
 
         # Feature #3: funding rate
         funding = await fetch_funding_rate(symbol)
@@ -1456,10 +1565,7 @@ async def scan_signals():
             best_signal["confidence"] *= 1.1
 
         # Feature #13: cooldown
-        last_close = 0
-        for s in slippage_log:
-            if s.get("symbol") == symbol:
-                last_close = max(last_close, s.get("time", 0))
+        last_close = last_closed_at.get(symbol, 0)
         if time.time() - last_close < cooldown_seconds():
             continue
 
@@ -1642,7 +1748,30 @@ async def setup_telegram():
 
     app = Application.builder().token(TG_TOKEN).build()
 
+    # Bug fix: only the configured chat may issue commands
+    def _authorized(update) -> bool:
+        if not TG_CHAT_ID:
+            return True  # not configured -> open (legacy)
+        try:
+            chat_id_str = str(update.effective_chat.id) if update.effective_chat else ""
+        except Exception:
+            return False
+        return chat_id_str == str(TG_CHAT_ID)
+
+    async def _reject(update):
+        try:
+            uid = update.effective_chat.id if update.effective_chat else "?"
+        except Exception:
+            uid = "?"
+        log.warning("Unauthorized Telegram command attempt from chat_id=%s", uid)
+        try:
+            await update.message.reply_text("Unauthorized.")
+        except Exception:
+            pass
+
     async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _authorized(update):
+            return await _reject(update)
         await update.message.reply_text(
             "\U0001f3db OLYMPUS Trading Bot aktiv!\n"
             "/status - Bot Status\n/report - Bericht\n"
@@ -1652,6 +1781,8 @@ async def setup_telegram():
         )
 
     async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _authorized(update):
+            return await _reject(update)
         eq = await fetch_balance()
         active = "Ja" if bot_active and not bot_paused else "Nein"
         text = (f"\U0001f4ca <b>Status</b>\nAktiv: {active}\n"
@@ -1662,9 +1793,13 @@ async def setup_telegram():
 
     # Bug #4 fix: proper async handler
     async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _authorized(update):
+            return await _reject(update)
         await send_report("manuell")
 
     async def cmd_trades(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _authorized(update):
+            return await _reject(update)
         if not active_trades:
             await update.message.reply_text("Keine offenen Trades.")
             return
@@ -1674,22 +1809,30 @@ async def setup_telegram():
         await update.message.reply_text(text, parse_mode="HTML")
 
     async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _authorized(update):
+            return await _reject(update)
         global bot_paused
         bot_paused = True
         await update.message.reply_text("\u23f8 Bot pausiert.")
 
     # Bug #6 fix: separate resume from drawdown logic
     async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _authorized(update):
+            return await _reject(update)
         global bot_paused, bot_active
         bot_paused = False
         bot_active = True
         await update.message.reply_text("\u25b6\ufe0f Bot fortgesetzt.")
 
     async def cmd_close_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _authorized(update):
+            return await _reject(update)
         await close_all("manuell via Telegram")
         await update.message.reply_text("\u2705 Alle Positionen geschlossen.")
 
     async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _authorized(update):
+            return await _reject(update)
         q = " ".join(context.args) if context.args else ""
         if not q:
             await update.message.reply_text("Bitte Frage: /ask <frage>")
@@ -1782,13 +1925,17 @@ async def start_dashboard():
     async def dash_handler(request):
         token = request.query.get("token", "")
         auth_h = request.headers.get("Authorization", "")
-        if token != DASH_TOKEN and auth_h != f"Bearer {DASH_TOKEN}":
+        bearer_match = auth_h.startswith("Bearer ") and hmac.compare_digest(auth_h[7:], DASH_TOKEN)
+        if not (hmac.compare_digest(token, DASH_TOKEN) or bearer_match):
             return web.Response(text="Unauthorized. Add ?token=YOUR_TOKEN", status=401)
 
         equity = await fetch_balance()
         pos_html = ""
         for sym, t in active_trades.items():
-            pos_html += f"<tr><td>{sym}</td><td>{t['side'].upper()}</td><td>{sf(t['entry'])}</td></tr>\n"
+            # HTML-escape symbol & side to defend against any future user-controlled values
+            sym_e = html.escape(str(sym))
+            side_e = html.escape(str(t.get("side", "")).upper())
+            pos_html += f"<tr><td>{sym_e}</td><td>{side_e}</td><td>{sf(t['entry'])}</td></tr>\n"
         if not active_trades:
             pos_html = "<tr><td colspan=3>Keine</td></tr>"
 
@@ -1809,7 +1956,7 @@ async def start_dashboard():
 
     async def api_status(request):
         token = request.query.get("token", "")
-        if token != DASH_TOKEN:
+        if not hmac.compare_digest(token, DASH_TOKEN):
             return web.Response(text="Unauthorized", status=401)
         return web.json_response({
             "active": bot_active, "paused": bot_paused,
@@ -1824,7 +1971,7 @@ async def start_dashboard():
     await runner.setup()
     site = web.TCPSite(runner, CFG["dash_host"], CFG["dash_port"])
     await site.start()
-    log.info("Dashboard: http://%s:%d/?token=%s", CFG["dash_host"], CFG["dash_port"], DASH_TOKEN)
+    log.info("Dashboard: http://%s:%d/?token=***", CFG["dash_host"], CFG["dash_port"])
     return runner
 
 
@@ -1902,9 +2049,10 @@ async def equity_snapshot():
         dd = (peak_equity - equity) / peak_equity if peak_equity > 0 else 0
         await db_save_equity(equity, dd)
         equity_history.append((time.time(), equity))
+        # Drop entries older than the sprint window (deque.popleft)
         cutoff = time.time() - CFG["sprint_hours"] * 3600
         while equity_history and equity_history[0][0] < cutoff:
-            equity_history.pop(0)
+            equity_history.popleft()
 
 
 async def check_daily_reset():
@@ -1933,8 +2081,11 @@ async def main_loop():
     await db_load_daily()
 
     saved_peak = await db_load_state("peak_equity")
-    if saved_peak:
-        peak_equity = float(saved_peak)
+    if saved_peak is not None:
+        try:
+            peak_equity = float(saved_peak)
+        except (TypeError, ValueError):
+            peak_equity = 0.0
 
     await warmup_ml()
     await update_correlations()
@@ -2021,17 +2172,34 @@ async def main_loop():
 
 
 async def _run_telegram(app):
-    try:
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling(drop_pending_updates=True)
-        while not shutdown_event.is_set():
-            await asyncio.sleep(1)
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
-    except Exception as e:
-        log.error("Telegram error: %s", e)
+    """Run telegram polling; reconnect on transient failures."""
+    backoff = 5
+    while shutdown_event is None or not shutdown_event.is_set():
+        try:
+            await app.initialize()
+            await app.start()
+            await app.updater.start_polling(drop_pending_updates=True)
+            backoff = 5  # reset on successful start
+            while not shutdown_event.is_set():
+                await asyncio.sleep(1)
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.error("Telegram polling failed: %s; reconnecting in %ds", e, backoff)
+            try:
+                await app.shutdown()
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=backoff)
+                return
+            except asyncio.TimeoutError:
+                pass
+            backoff = min(backoff * 2, 300)
 
 
 # ===========================================================================
